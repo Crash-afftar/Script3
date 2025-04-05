@@ -1,0 +1,6 @@
+requests
+python-dotenv
+python-telegram-bot
+python-json-logger
+python-bingx
+# bingx-api-library # Потрібно знайти або написати клієнт для BingX API

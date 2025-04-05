@@ -1,0 +1,41 @@
+{
+  "global_settings": {
+    "total_bankroll": 100,
+    "bingx_api_key": "YOUR_API_KEY",
+    "bingx_api_secret": "YOUR_API_SECRET"
+  },
+  "channels": {
+    "channel_1": {
+      "name": "VIP марафон | Даниэль",
+      "entry_percentage": 5,
+      "tp_distribution": [30, 50, 20],
+      "leverage": 10
+    },
+    "channel_2": {
+      "name": "Crypto Alliance | Мартин",
+      "entry_percentage": 5,
+      "tp_distribution": [30, 50, 20],
+      "leverage": 10
+    },
+    "channel_3": {
+      "name": "Внутри графика с Джимми",
+      "entry_percentage": 4,
+      "tp_distribution": [70, 30],
+      "max_open_positions": 3,
+      "leverage": 5
+    },
+    "channel_4": {
+      "name": "KostyaKogan",
+      "entry_percentage": 5,
+      "tp_distribution": [40, 40, 20],
+      "leverage": 18
+    }
+  },
+  "position_limits": {
+    "group_1_2_4_max_open": 2
+  },
+  "notifications": {
+    "telegram_bot_token": "YOUR_BOT_TOKEN",
+    "telegram_chat_id": "YOUR_CHAT_ID"
+  }
+}

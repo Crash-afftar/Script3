@@ -1,0 +1,1 @@
+# Module for managing data storage (signals, trades, logs) 
