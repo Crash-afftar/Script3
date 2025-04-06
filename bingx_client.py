@@ -392,7 +392,7 @@ class BingXClient:
                     'stopPrice': tp_price,
                     'positionSide': position_side.upper(),
                     'workingType': 'MARK_PRICE',
-                    'reduceOnly': True 
+                    # 'reduceOnly': True 
                 }
                 self.logger.debug(f"Параметри для create_order (TP {i+1}): symbol={ccxt_market_symbol}, type={order_type}, side={tp_side}, amount={amount_to_place_final}, params={params}")
 
@@ -431,6 +431,191 @@ class BingXClient:
                 self.logger.info(f"Ордер {order_id} успішно скасовано.")
             except Exception as e:
                 self.logger.error(f"Помилка при скасуванні ордера {order_id}: {e}", exc_info=True)
+
+    def fetch_order(self, symbol: str, order_id: str):
+        """Отримує інформацію про конкретний ордер за ID."""
+        if not self.exchange:
+            self.logger.error("[BingXClient] Спроба викликати fetch_order на неініціалізованому клієнті.")
+            return None
+            
+        ccxt_market_symbol = self._format_symbol_for_swap(symbol)
+        self.logger.info(f"[BingXClient] Запит даних ордера ID: {order_id} для {ccxt_market_symbol}...")
+        
+        try:
+            order_info = self.exchange.fetch_order(order_id, ccxt_market_symbol)
+            self.logger.info(f"[BingXClient] Дані для ордера {order_id} успішно отримано.")
+            self.logger.debug(f"Деталі ордера {order_id}: {order_info}")
+            return order_info
+        except ccxt.OrderNotFound as e:
+            self.logger.warning(f"[BingXClient] Ордер ID {order_id} для {ccxt_market_symbol} не знайдено: {e}")
+            return None # Повертаємо None, якщо ордер не знайдено
+        except ccxt.ExchangeError as e:
+            self.logger.error(f"[BingXClient] Помилка біржі при запиті ордера {order_id} для {ccxt_market_symbol}: {e}", exc_info=True)
+            return None
+        except Exception as e:
+            self.logger.error(f"[BingXClient] Невідома помилка при запиті ордера {order_id} для {ccxt_market_symbol}: {e}", exc_info=True)
+            return None
+            
+    def edit_order(self, symbol: str, order_id: str, new_price: float, new_amount: float = None):
+        """Спроба модифікувати існуючий ордер (наприклад, ціну SL).
+        УВАГА: Підтримка та параметри залежать від біржі та ccxt. 
+               Може знадобитися інший підхід (cancel + create)."""
+        if not self.exchange:
+            self.logger.error("[BingXClient] Спроба викликати edit_order на неініціалізованому клієнті.")
+            return None
+
+        ccxt_market_symbol = self._format_symbol_for_swap(symbol)
+        self.logger.info(f"[BingXClient] Спроба змінити ордер ID: {order_id} ({ccxt_market_symbol}). Нова ціна: {new_price}, Нова кількість: {new_amount}")
+
+        try:
+            # Спочатку отримуємо інформацію про ордер, щоб знати його тип, сторону і т.д.
+            existing_order = self.fetch_order(ccxt_market_symbol, order_id)
+            if not existing_order:
+                self.logger.error(f"[BingXClient] Не вдалося отримати дані для ордера {order_id} перед редагуванням.")
+                return None
+                
+            # --- Логіка визначення параметрів для edit_order ---
+            # Це дуже залежить від ccxt і біржі. Нам потрібно передати *всі* необхідні параметри, 
+            # навіть якщо ми міняємо лише ціну. 
+            # Особливо важливо для SL/TP, де може знадобитись `stopPrice`.
+            
+            order_type = existing_order.get('type')
+            order_side = existing_order.get('side')
+            original_amount = existing_order.get('amount')
+            
+            # Якщо нова кількість не вказана, використовуємо оригінальну
+            amount_to_use = new_amount if new_amount is not None else original_amount
+            if amount_to_use is None:
+                 self.logger.error(f"[BingXClient] Не вдалося визначити кількість для редагування ордера {order_id}.")
+                 return None
+
+            # Округлення нової кількості (якщо вона змінилась)
+            if new_amount is not None:
+                 amount_to_use = self._round_amount(amount_to_use, ccxt_market_symbol)
+                 if amount_to_use is None or amount_to_use <= 0:
+                      self.logger.error(f"[BingXClient] Некоректна нова кількість {new_amount} для ордера {order_id}.")
+                      return None
+
+            # Параметри, які, ймовірно, потрібні для edit_order (можуть відрізнятись!)
+            params = {}
+            if order_type in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']:
+                # Для SL/TP головне - змінити stopPrice
+                 params['stopPrice'] = new_price 
+                 # Можливо, BingX вимагає й інші параметри тут, напр. positionSide
+                 if 'info' in existing_order and 'positionSide' in existing_order['info']:
+                      params['positionSide'] = existing_order['info']['positionSide']
+                 else: 
+                      # Спробуємо вгадати positionSide з side (не надійно!)
+                      params['positionSide'] = 'LONG' if order_side == 'sell' else 'SHORT' # sell для закриття long, buy для закриття short
+                      self.logger.warning(f"Не вдалося визначити positionSide для ордеру {order_id}. Використовуємо припущення: {params['positionSide']}")
+
+            elif order_type == 'limit':
+                 # Для лімітних ордерів міняємо price
+                 params['price'] = new_price
+                 # Також може знадобитись positionSide
+                 if 'info' in existing_order and 'positionSide' in existing_order['info']:
+                     params['positionSide'] = existing_order['info']['positionSide']
+            else:
+                 self.logger.error(f"[BingXClient] Редагування ордерів типу '{order_type}' поки не підтримується цим методом.")
+                 return None
+                 
+            # Округлення нової ціни (якщо це price або stopPrice)
+            price_param_key = 'stopPrice' if order_type in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] else 'price'
+            rounded_new_price_str = self.exchange.price_to_precision(ccxt_market_symbol, params[price_param_key])
+            rounded_new_price = float(rounded_new_price_str)
+            params[price_param_key] = rounded_new_price
+            
+            self.logger.info(f"Виклик edit_order для {order_id}: symbol={ccxt_market_symbol}, type={order_type}, side={order_side}, amount={amount_to_use}, params={params}")
+
+            edited_order = self.exchange.edit_order(
+                id=order_id, 
+                symbol=ccxt_market_symbol, 
+                type=order_type, 
+                side=order_side, 
+                amount=amount_to_use, 
+                price=params.get('price'), # Передаємо price=None, якщо це SL/TP
+                params=params
+            )
+            
+            self.logger.info(f"[BingXClient] Ордер {order_id} успішно змінено (або створено новий з тим же ID).")
+            self.logger.debug(f"Деталі зміненого ордеру: {edited_order}")
+            return edited_order
+
+        except ccxt.NotSupported as e:
+            self.logger.error(f"[BingXClient] Біржа BingX (через ccxt) не підтримує edit_order: {e}. Потрібно реалізувати Cancel+Create.")
+            # TODO: Додати логіку Cancel+Create тут або вище
+            return None
+        except ccxt.OrderNotFound as e:
+            self.logger.warning(f"[BingXClient] Ордер {order_id} не знайдено під час спроби редагування: {e}")
+            return None
+        except ccxt.InvalidOrder as e:
+             self.logger.error(f"[BingXClient] Неприпустимий запит на редагування ордера {order_id}: {e}", exc_info=True)
+             return None
+        except ccxt.ExchangeError as e:
+            self.logger.error(f"[BingXClient] Помилка біржі при редагуванні ордера {order_id}: {e}", exc_info=True)
+            return None
+        except Exception as e:
+            self.logger.error(f"[BingXClient] Невідома помилка при редагуванні ордера {order_id}: {e}", exc_info=True)
+            return None
+
+    def fetch_positions(self, symbol: str = None):
+        """Отримує список відкритих позицій (для конкретного символу або всіх)."""
+        if not self.exchange:
+            self.logger.error("[BingXClient] Спроба викликати fetch_positions на неініціалізованому клієнті.")
+            return None
+            
+        target_symbol = None
+        if symbol:
+            target_symbol = self._format_symbol_for_swap(symbol)
+            self.logger.info(f"[BingXClient] Запит відкритих позицій для {target_symbol}...")
+        else:
+             self.logger.info(f"[BingXClient] Запит всіх відкритих позицій...")
+
+        try:
+            # fetch_positions може приймати список символів
+            positions = self.exchange.fetch_positions(symbols=[target_symbol] if target_symbol else None)
+            # Фільтруємо позиції з нульовим розміром (ccxt іноді повертає закриті)
+            active_positions = [p for p in positions if p.get('contracts') is not None and float(p.get('contracts', 0)) != 0]
+            
+            self.logger.info(f"[BingXClient] Отримано {len(active_positions)} активних позицій" + (f" для {target_symbol}." if target_symbol else "."))
+            self.logger.debug(f"Активні позиції: {active_positions}")
+            return active_positions
+            
+        except ccxt.ExchangeError as e:
+            self.logger.error(f"[BingXClient] Помилка біржі при запиті позицій" + (f" для {target_symbol}" if target_symbol else "") + f": {e}", exc_info=True)
+            return None
+        except Exception as e:
+            self.logger.error(f"[BingXClient] Невідома помилка при запиті позицій" + (f" для {target_symbol}" if target_symbol else "") + f": {e}", exc_info=True)
+            return None
+
+    def cancel_order(self, symbol: str, order_id: str):
+        """Скасовує конкретний ордер за його ID."""
+        if not self.exchange:
+            self.logger.error("[BingXClient] Спроба викликати cancel_order на неініціалізованому клієнті.")
+            return None
+            
+        ccxt_market_symbol = self._format_symbol_for_swap(symbol)
+        self.logger.info(f"[BingXClient] Спроба скасувати ордер ID: {order_id} для {ccxt_market_symbol}...")
+        
+        try:
+            # ccxt.cancel_order повертає інформацію про скасований ордер або None/undefined
+            # BingX може вимагати символ, навіть якщо ID унікальний
+            result = self.exchange.cancel_order(order_id, ccxt_market_symbol) 
+            self.logger.info(f"[BingXClient] Ордер {order_id} успішно скасовано (або вже був неактивний).")
+            self.logger.debug(f"Результат скасування для {order_id}: {result}")
+            # Повертаємо True для індикації успіху (навіть якщо ордер вже був закритий/скасований)
+            # Якщо була помилка (напр., OrderNotFound), ccxt кине виняток
+            return True 
+        except ccxt.OrderNotFound as e:
+            # Ордер вже не існує (був виконаний або скасований раніше) - це НЕ помилка для нас
+            self.logger.warning(f"[BingXClient] Ордер {order_id} ({ccxt_market_symbol}) не знайдено під час скасування (можливо, вже закритий): {e}")
+            return True # Вважаємо успіхом, бо ордера більше немає
+        except ccxt.ExchangeError as e:
+            self.logger.error(f"[BingXClient] Помилка біржі при скасуванні ордера {order_id} для {ccxt_market_symbol}: {e}", exc_info=True)
+            return False
+        except Exception as e:
+            self.logger.error(f"[BingXClient] Невідома помилка при скасуванні ордера {order_id} для {ccxt_market_symbol}: {e}", exc_info=True)
+            return False
 
 if __name__ == "__main__":
     # Налаштування логера
