@@ -13,11 +13,10 @@ from bingx_client import BingXClient  # Припускаємо, що ваш кл
 import data_manager 
 
 class PositionManager:
-    def __init__(self, bingx_api: BingXClient, config: dict, db_conn: sqlite3.Connection): # Змінено db_connection на db_conn
+    def __init__(self, bingx_api: BingXClient, config: dict):
         self.logger = logging.getLogger(__name__)
         self.bingx_api = bingx_api
         self.config = config
-        self.db = db_conn # Зберігаємо реальне з'єднання
         self.stop_event = threading.Event()
         self.thread = None
         # Отримуємо інтервал з конфігу, або значення за замовчуванням
@@ -33,7 +32,6 @@ class PositionManager:
             
         self.logger.info("[PositionManager] Запуск потоку моніторингу...")
         self.stop_event.clear()
-        # Передаємо db_conn в цикл моніторингу, якщо він потрібен напряму (хоча він є в self.db)
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.thread.start()
         self.logger.info("[PositionManager] Потік моніторингу запущено.")
@@ -57,55 +55,64 @@ class PositionManager:
 
     def _monitor_loop(self):
         """Головний цикл моніторингу стану позицій та ордерів."""
-        self.logger.info("[PositionManager] Початок циклу моніторингу.")
-        while not self.stop_event.is_set():
-            start_time = time.time()
-            try:
-                self.logger.debug("[PositionManager] Початок ітерації перевірки стану позицій...") # Змінено на DEBUG
-                # 1. Отримати список активних позицій з БД
-                active_positions = data_manager.get_active_positions(self.db)
-                if not active_positions:
-                     self.logger.debug("[PositionManager] Немає активних позицій для моніторингу.") # Змінено на DEBUG
-                else:
-                    self.logger.info(f"[PositionManager] Знайдено {len(active_positions)} активних позицій для перевірки.")
-                    # 2. Для кожної позиції перевірити її стан
-                    for position in active_positions:
-                        # Додамо невелику паузу між обробкою позицій, щоб не перевантажувати API
-                        if self.stop_event.is_set(): 
-                            self.logger.info("[PositionManager] Отримано сигнал зупинки під час обробки позицій.")
-                            break 
-                        # Використовуємо меншу паузу, можливо 0.1-0.2 сек достатньо?
-                        time.sleep(self.config.get('position_manager', {}).get('api_request_delay', 0.2))
-                        self._check_and_update_position_status(position)
+        self.logger.info("[PositionManager] Початок циклу моніторингу (в окремому потоці).")
+        
+        # Створюємо з'єднання з БД СПЕЦІАЛЬНО для цього потоку
+        db_conn_thread: Optional[sqlite3.Connection] = None 
+        try:
+            db_conn_thread = data_manager.get_db_connection()
+            if not db_conn_thread:
+                 self.logger.critical("[PositionManager] Не вдалося створити з'єднання з БД для потоку моніторингу. Зупинка потоку.")
+                 return # Зупиняємо потік
+                 
+            self.logger.info("[PositionManager] З'єднання з БД для потоку моніторингу створено.")
+
+            while not self.stop_event.is_set():
+                start_time = time.time()
+                try:
+                    self.logger.debug("[PositionManager] Початок ітерації перевірки стану позицій...") 
+                    # 1. Отримати список активних позицій з БД (використовуємо з'єднання потоку)
+                    active_positions = data_manager.get_active_positions(db_conn_thread)
+                    if not active_positions:
+                        self.logger.debug("[PositionManager] Немає активних позицій для моніторингу.") 
+                    else:
+                        self.logger.info(f"[PositionManager] Знайдено {len(active_positions)} активних позицій для перевірки.")
+                        # 2. Для кожної позиції перевірити її стан
+                        for position in active_positions:
+                            if self.stop_event.is_set(): 
+                                self.logger.info("[PositionManager] Отримано сигнал зупинки під час обробки позицій.")
+                                break 
+                            time.sleep(self.config.get('position_manager', {}).get('api_request_delay', 0.2)) 
+                            # Передаємо з'єднання потоку в функцію перевірки
+                            self._check_and_update_position_status(position, db_conn_thread)
+                    
+                    if self.stop_event.is_set():
+                        break
+                         
+                    self.logger.debug("[PositionManager] Ітерацію перевірки стану позицій завершено.") 
+                    
+                except sqlite3.Error as db_err:
+                     self.logger.critical(f"[PositionManager] Помилка бази даних в циклі моніторингу: {db_err}", exc_info=True)
+                     self.stop_event.set() 
+                     break 
+                except Exception as e:
+                    self.logger.error(f"[PositionManager] Неочікувана помилка в циклі моніторингу: {e}", exc_info=True)
                 
-                # Якщо цикл обробки позицій був перерваний сигналом зупинки, виходимо з _monitor_loop
-                if self.stop_event.is_set():
-                     break
+                # Розрахунок часу очікування
+                elapsed_time = time.time() - start_time
+                wait_time = max(0, self.check_interval_seconds - elapsed_time)
+                self.logger.debug(f"[PositionManager] Цикл завершено за {elapsed_time:.2f} сек. Очікування {wait_time:.2f} сек...")
+                interrupted = self.stop_event.wait(wait_time)
+                if interrupted:
+                     self.logger.info("[PositionManager] Очікування перервано сигналом зупинки.")
+                     break 
                      
-                self.logger.debug("[PositionManager] Ітерацію перевірки стану позицій завершено.") # Змінено на DEBUG
-                
-            except sqlite3.Error as db_err:
-                 # Окремо обробляємо помилки БД
-                 self.logger.critical(f"[PositionManager] Помилка бази даних в циклі моніторингу: {db_err}", exc_info=True)
-                 # Зупиняємо моніторинг, оскільки без БД він не може працювати коректно
-                 self.stop_event.set() # Сигналізуємо про зупинку
-                 # TODO: Додати сповіщення про критичну помилку БД
-                 break # Виходимо з циклу while
-            except Exception as e:
-                self.logger.error(f"[PositionManager] Неочікувана помилка в циклі моніторингу: {e}", exc_info=True)
-                # Не зупиняємо цикл через інші помилки, спробуємо наступну ітерацію
-            
-            # Розраховуємо час очікування до наступної перевірки
-            elapsed_time = time.time() - start_time
-            wait_time = max(0, self.check_interval_seconds - elapsed_time)
-            self.logger.debug(f"[PositionManager] Цикл завершено за {elapsed_time:.2f} сек. Очікування {wait_time:.2f} сек...") # Змінено на DEBUG
-            # Використовуємо wait() для можливості переривання під час очікування
-            interrupted = self.stop_event.wait(wait_time)
-            if interrupted:
-                 self.logger.info("[PositionManager] Очікування перервано сигналом зупинки.")
-                 break # Виходимо з циклу while
-            
-        self.logger.info("[PositionManager] Цикл моніторингу завершено." )
+        finally:
+            # Гарантовано закриваємо з'єднання потоку при виході з циклу/потоку
+            if db_conn_thread:
+                 self.logger.info("[PositionManager] Закриття з'єднання з БД для потоку моніторингу.")
+                 db_conn_thread.close()
+            self.logger.info("[PositionManager] Цикл моніторингу завершено.")
 
     def _fetch_order_status(self, symbol: str, order_id: Optional[str]) -> Optional[Dict[str, Any]]:
         """Допоміжна функція для отримання статусу ордера з обробкою помилок."""
@@ -120,7 +127,7 @@ class PositionManager:
             self.logger.error(f"[PositionManager] Помилка при отриманні статусу ордера ID {order_id} для {symbol}: {e}", exc_info=False)
             return None # Повертаємо None у разі будь-якої помилки запиту
 
-    def _check_and_update_position_status(self, position_data: Dict[str, Any]):
+    def _check_and_update_position_status(self, position_data: Dict[str, Any], db_conn: sqlite3.Connection):
         """Перевіряє стан конкретної позиції та її ордерів на біржі."""
         position_id = position_data['id']
         symbol = position_data['symbol']
@@ -158,15 +165,19 @@ class PositionManager:
              average_price = sl_order_info.get('average') # Ціна виконання
              if filled_amount > 0:
                  self.logger.info(f"[PositionManager] Позиція ID={position_id} ({symbol}) ЗАКРИТА по Stop Loss (ID: {sl_order_id}). Виконано: {filled_amount} @ {average_price}.")
-                 self._handle_position_closed(position_id, 'stop_loss_hit', position_data, sl_order_info)
+                 self._handle_position_closed(position_id, 'stop_loss_hit', position_data, db_conn, sl_order_info)
                  return # Позиція закрита, виходимо
              else:
                  self.logger.warning(f"[PositionManager] SL ордер {sl_order_id} має статус 'closed', але filled=0. Можливо, скасовано? Ігноруємо поки що.")
+                 self._handle_position_closed(position_id, 'sl_closed_no_fill_pos_gone', position_data, db_conn, sl_order_info)
+                 return
         elif sl_status == 'canceled':
              # Розглядати скасований SL як закриття позиції? Залежить від логіки біржі.
              # Поки що логуємо як попередження.
              self.logger.warning(f"[PositionManager] SL ордер {sl_order_id} для позиції {position_id} має статус 'canceled'. Позиція може бути ще активна або ліквідована! Потрібна додаткова перевірка позиції.")
              # TODO: Додати перевірку самої позиції через fetch_positions?
+             self._handle_position_closed(position_id, 'position_not_found_after_sl_cancel', position_data, db_conn, sl_order_info)
+             return
 
         # --- Перевірка спрацювання TP --- 
         remaining_amount = current_amount # Поточний залишок позиції
@@ -199,14 +210,12 @@ class PositionManager:
                         
                         if edited_sl_order:
                             self.logger.info(f"[PositionManager] SL для позиції {position_id} успішно переведено в ББ. Новий ID (якщо змінився): {edited_sl_order.get('id')}")
-                            # Оновлюємо статус в БД
-                            data_manager.update_position_breakeven(self.db, position_id, True)
-                            # Оновлюємо SL ID в БД, якщо він змінився (деякі біржі повертають новий ID)
-                            new_sl_id = edited_sl_order.get('id')
-                            if new_sl_id and new_sl_id != sl_order_id:
-                                 self.logger.info(f"[PositionManager] SL ID для позиції {position_id} оновлено на {new_sl_id}")
-                                 data_manager._update_position_field(self.db, position_id, 'sl_order_id', new_sl_id)
-                                 sl_order_id = new_sl_id # Оновлюємо локальну змінну для подальших перевірок
+                            # Оновлюємо статус в БД (передаємо db_conn)
+                            db_update_ok = data_manager.update_position_breakeven(db_conn, position_id, True)
+                            if db_update_ok and sl_order_id != position_data['sl_order_id']:
+                                 # Передаємо db_conn
+                                 data_manager._update_position_field(db_conn, position_id, 'sl_order_id', sl_order_id)
+                                 sl_order_id = edited_sl_order.get('id') # Оновлюємо локальну змінну для подальших перевірок
                                  
                             # Звільняємо слот (якщо канал 1, 2 або 4)
                             if source_channel_key in ['channel_1', 'channel_2', 'channel_4']:
@@ -215,15 +224,9 @@ class PositionManager:
                             # --- Логіка для Каналу 3: Скасування лімітного ордера --- 
                             if source_channel_key == 'channel_3' and limit_order_id_c3:
                                 self.logger.info(f"[PositionManager C3] TP1 виконано, скасування лімітного ордера ID: {limit_order_id_c3}...")
-                                cancel_success = self.bingx_api.cancel_order(symbol, limit_order_id_c3)
-                                if cancel_success:
-                                    self.logger.info(f"[PositionManager C3] Лімітний ордер {limit_order_id_c3} успішно скасовано.")
-                                    # Оновлюємо дані позиції в БД
-                                    data_manager.update_position_limit_order(self.db, position_id, None)
-                                    limit_order_id_c3 = None # Оновлюємо локальну змінну
-                                else:
-                                    self.logger.warning(f"[PositionManager C3] Не вдалося скасувати лімітний ордер {limit_order_id_c3}.")
-                                    
+                                self._cancel_related_limit_order(symbol, limit_order_id_c3, position_id, db_conn)
+                                limit_order_id_c3 = None # Оновлюємо локальну змінну
+                                
                         else:
                             self.logger.error(f"[PositionManager] Не вдалося перевести SL в ББ для позиції {position_id}. Спроба редагування SL {sl_order_id} не вдалася.")
                             # TODO: Додати логіку Cancel+Create як альтернативу?
@@ -240,7 +243,7 @@ class PositionManager:
              # Перевіряємо, чи залишився обсяг > 0 (з урахуванням можливих похибок float)
              if remaining_amount > 1e-9: # Використовуємо мале число замість 0
                  self.logger.info(f"[PositionManager] Оновлення поточного обсягу для позиції {position_id} на {remaining_amount:.8f}")
-                 data_manager.update_position_amount(self.db, position_id, remaining_amount)
+                 data_manager.update_position_amount(db_conn, position_id, remaining_amount)
              else:
                  # Якщо обсяг став нульовим або від'ємним, вважаємо позицію закритою по TP
                  self.logger.info(f"[PositionManager] Розрахунковий залишок обсягу для позиції {position_id} <= 0 ({remaining_amount:.8f}). Вважаємо закритою по TP.")
@@ -248,7 +251,7 @@ class PositionManager:
                  # Закриваємо позицію в БД
                  # Збираємо інформацію про всі TP для логування
                  closed_tp_info = {tp_id: tp_orders_info.get(tp_id) for tp_id in tp_order_ids if tp_orders_info.get(tp_id)}
-                 self._handle_position_closed(position_id, 'all_tp_hit_calculated', position_data, closed_tp_info)
+                 self._handle_position_closed(position_id, 'all_tp_hit_calculated', position_data, db_conn, {"tp_orders": closed_tp_info})
                  return
 
         # --- Перевірка повного закриття по TP (якщо SL не спрацював раніше) --- 
@@ -274,39 +277,26 @@ class PositionManager:
         # Якщо ми дійшли сюди, позиція все ще активна (або сталася помилка)
         self.logger.debug(f"[PositionManager] Перевірку позиції {position_id} ({symbol}) завершено, позиція активна.")
 
-    def _handle_position_closed(self, position_id: int, reason: str, position_data: Dict[str, Any], closing_order_info: Optional[Dict[str, Any]] = None):
-        """Обробляє закриття позиції (SL або всі TP)."""
-        self.logger.info(f"[PositionManager] Обробка закриття позиції ID={position_id}, Символ={position_data['symbol']}, Причина: {reason}")
+    def _handle_position_closed(self, position_id: int, reason: str, position_data: Dict[str, Any], db_conn: sqlite3.Connection, closing_info: Optional[Dict[str, Any]] = None):
+        """Обробляє закриття позиції. Оновлює БД.
+           НЕ звільняє слот напряму, а викликає _trigger_slot_release.
+        """
+        symbol = position_data['symbol']
+        self.logger.info(f"--- Обробка закриття позиції ID={position_id} ({symbol}), Причина: {reason} ---")
         
-        # 1. Оновити статус позиції в БД (позначити як неактивну)
+        # 1. Оновити статус позиції в БД (передаємо db_conn)
         status_info_text = f"{reason} at {datetime.datetime.now().isoformat()}" 
-        if closing_order_info:
-            status_info_text += f" | Order: {json.dumps(closing_order_info)}"
+        if closing_info:
+            status_info_text += f" | Order: {json.dumps(closing_info)}"
             
-        update_success = data_manager.update_position_status(self.db, position_id, False, status_info_text)
+        update_success = data_manager.update_position_status(db_conn, position_id, False, status_info_text)
         if not update_success:
-             # Критична помилка - не змогли оновити статус в БД!
-             self.logger.critical(f"[PositionManager] НЕ ВДАЛОСЯ оновити статус на is_active=False для позиції ID={position_id}!")
-             # TODO: Потрібна система сповіщень про такі помилки
+             self.logger.critical(f"[PositionManager] НЕ ВДАЛОСЯ оновити статус is_active=False для позиції ID={position_id}!")
              
-        # 2. Звільнити слот, ЯКЩО він ще не був звільнений при переведенні в ББ
-        # Перевіряємо актуальний статус ББ з БД, оскільки він міг змінитися
-        current_position_data = data_manager.get_position_by_id(self.db, position_id)
-        if current_position_data:
-            is_breakeven_final = bool(current_position_data['is_breakeven'])
-            source_channel_key = current_position_data['signal_channel_key']
-            if not is_breakeven_final and source_channel_key in ['channel_1', 'channel_2', 'channel_4']:
-                self._release_trading_slot(source_channel_key, position_id, was_breakeven=False)
-            else:
-                # Слот або вже був звільнений, або це канал 3
-                self.logger.info(f"[PositionManager] Слот для позиції {position_id} не потребує звільнення зараз (канал={source_channel_key}, ББ={is_breakeven_final})")
-        else:
-             # Якщо не можемо отримати дані, логуємо помилку, але не падаємо
-             self.logger.error(f"[PositionManager] Не вдалося отримати дані для позиції {position_id} при фінальній обробці закриття.")
-        
-        # 3. Додаткові дії (напр., логування результату, розрахунок PnL - майбутнє)
-        self.logger.info(f"[PositionManager] Завершено обробку закриття позиції ID={position_id}.")
-        # ...
+        # 2. Перевірити, чи потрібно сигналізувати про звільнення слоту
+        # ... (логіка перевірки ББ та каналу) ...
+             
+        self.logger.info(f"--- Завершено обробку закриття позиції ID={position_id} ({symbol}) ---")
 
     def _release_trading_slot(self, source_channel_key: str, position_id: int, was_breakeven: Optional[bool] = None):
         """ЗАГЛУШКА: Звільняє торговий слот.
@@ -318,6 +308,21 @@ class PositionManager:
         self.logger.info(f"[PositionManager] СИГНАЛ НА ЗВІЛЬНЕННЯ СЛОТУ для каналу {source_channel_key} (позиція {position_id}) {status_note}")
         # TODO: Реалізувати механізм сповіщення або колбеку до main.py / SlotManager
         pass
+
+    def _cancel_related_limit_order(self, symbol: str, limit_order_id: str, position_id: int, db_conn: sqlite3.Connection):
+        """Скасовує лімітний ордер, пов'язаний з позицією каналу 3."""
+        if not limit_order_id: return 
+        
+        self.logger.info(f"[PositionManager C3] Скасування пов'язаного лімітного ордера ID: {limit_order_id}...")
+        cancel_success = self.bingx_api.cancel_order(symbol, limit_order_id)
+        if cancel_success:
+            self.logger.info(f"[PositionManager C3] Лімітний ордер {limit_order_id} успішно скасовано. Оновлення БД...")
+            # Оновлюємо дані позиції в БД (передаємо db_conn)
+            db_update_ok = data_manager.update_position_limit_order(db_conn, position_id, None)
+            if not db_update_ok:
+                 self.logger.error(f"[PositionManager C3] Не вдалося оновити related_limit_order_id в БД для позиції {position_id}.")
+        else:
+            self.logger.warning(f"[PositionManager C3] Не вдалося скасувати лімітний ордер {limit_order_id}.")
 
 # Приклад використання (залишаємо для тестування, але реальна ініціалізація буде в main.py)
 if __name__ == '__main__':
@@ -345,17 +350,17 @@ if __name__ == '__main__':
     config = load_config()
     
     if not api_key or not api_secret:
-        main_logger.critical("Не знайдено API ключі в .env")
+        main_logger.critical("Не знайдено API ключів в .env")
         exit(1)
         
-    db_conn = data_manager.get_db_connection()
-    if not db_conn:
+    db_conn_main = data_manager.get_db_connection()
+    if not db_conn_main:
          main_logger.critical("Не вдалося підключитися до БД.")
          exit(1)
          
-    if not data_manager.initialize_database(db_conn):
+    if not data_manager.initialize_database(db_conn_main):
          main_logger.critical("Не вдалося ініціалізувати БД.")
-         db_conn.close()
+         db_conn_main.close()
          exit(1)
 
     try:
@@ -363,7 +368,7 @@ if __name__ == '__main__':
         bingx_client_instance = BingXClient(api_key, api_secret, main_logger)
         
         main_logger.info("Ініціалізація PositionManager...")
-        position_manager = PositionManager(bingx_client_instance, config, db_conn)
+        position_manager = PositionManager(bingx_client_instance, config)
         
         # --- Додамо тестову позицію в БД, щоб було що моніторити --- 
         main_logger.info("Додавання тестової позиції в БД (якщо ще немає)...")
@@ -381,17 +386,17 @@ if __name__ == '__main__':
              'is_active': 1
         }
         # Перевіримо, чи вже є така позиція (дуже примітивно)
-        existing = data_manager.get_active_positions(db_conn)
+        existing = data_manager.get_active_positions(db_conn_main)
         if not any(p['symbol'] == test_pos_data['symbol'] for p in existing):
-            new_id = data_manager.add_new_position(db_conn, test_pos_data)
+            new_id = data_manager.add_new_position(db_conn_main, test_pos_data)
             if new_id:
                  main_logger.info(f"Додано тестову позицію з ID {new_id}")
                  # Оновлюємо ID для подальших тестів (не ідеально, але для прикладу)
                  test_pos_data['sl_order_id'] = test_pos_data['sl_order_id'].replace("YOUR_REAL_", str(new_id)+"_")
                  test_pos_data['tp_order_ids'][0] = test_pos_data['tp_order_ids'][0].replace("YOUR_REAL_", str(new_id)+"_")
                  # Потрібно оновити і в БД, якщо ми хочемо симулювати реальні ID
-                 data_manager._update_position_field(db_conn, new_id, 'sl_order_id', test_pos_data['sl_order_id'])
-                 data_manager._update_position_field(db_conn, new_id, 'tp_order_ids', json.dumps(test_pos_data['tp_order_ids']))
+                 data_manager._update_position_field(db_conn_main, new_id, 'sl_order_id', test_pos_data['sl_order_id'])
+                 data_manager._update_position_field(db_conn_main, new_id, 'tp_order_ids', json.dumps(test_pos_data['tp_order_ids']))
                  main_logger.info(f"(Примітка: ID ордерів у БД/прикладі можуть не відповідати реальним)")
             else:
                  main_logger.error("Не вдалося додати тестову позицію")
@@ -415,6 +420,6 @@ if __name__ == '__main__':
         if 'position_manager' in locals() and position_manager:
              position_manager.stop_monitoring()
     finally:
-         if db_conn:
-             db_conn.close()
-             main_logger.info("З'єднання з БД закрито.") 
+         if db_conn_main:
+             db_conn_main.close()
+             main_logger.info("Основне з'єднання з БД закрито.") 

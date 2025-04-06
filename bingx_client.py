@@ -269,54 +269,74 @@ class BingXClient:
             self.logger.error(f"[Limit Order] Неочікувана помилка під час розміщення {side} ордера для {formatted_symbol}: {e}", exc_info=True)
         return None
 
-    def set_stop_loss(self, symbol: str, position_side: str, initial_amount: float, stop_loss_price: float):
-        """Встановлює ордер Stop Loss для існуючої позиції."""
-        if not self.exchange:
-            self.logger.error("[SL] Спроба викликати метод на неініціалізованому клієнті.")
-            return None
+    def set_stop_loss(self, symbol: str, position_side: str, sl_price: float, amount: float):
+        # --- Додано лог на вході ---
+        self.logger.debug(f"[SL] Вхід у set_stop_loss: symbol={symbol}, position_side={position_side}, sl_price={sl_price}, amount={amount}")
+        # --- Кінець логу на вході ---
 
         ccxt_market_symbol = self._format_symbol_for_swap(symbol)
         sl_side = 'sell' if position_side.upper() == 'LONG' else 'buy'
         self.logger.info(f"-- Встановлення Stop Loss для {ccxt_market_symbol} --")
         order_type = 'STOP_MARKET'
-        self.logger.info(f"Параметри: Side={sl_side}, Amount={initial_amount}, SL Price={stop_loss_price}, Type={order_type}")
+        self.logger.info(f"Параметри: Side={sl_side}, Amount={amount}, SL Price={sl_price}, Type={order_type}")
 
         try:
-            amount_to_set = self._round_amount(initial_amount, ccxt_market_symbol)
+            # --- Додано лог перед округленням ---
+            self.logger.debug(f"[SL] Перед викликом _round_amount: amount={amount}, symbol={ccxt_market_symbol}")
+            # --- Кінець логу перед округленням ---
+            amount_to_set = self._round_amount(amount, ccxt_market_symbol)
             if amount_to_set is None or amount_to_set <= 0:
-                self.logger.error(f"[SL] Не вдалося округлити обсяг {initial_amount} або результат нульовий/від'ємний: {amount_to_set}")
+                self.logger.error(f"[SL] Не вдалося округлити обсяг {amount} або результат нульовий/від'ємний: {amount_to_set}")
                 return None
 
-            self.logger.info(f"[SL] Округлений обсяг для встановлення: {amount_to_set}")
+            sl_price_str = self.exchange.price_to_precision(ccxt_market_symbol, sl_price)
+            sl_price_rounded = float(sl_price_str)
+            self.logger.info(f"[SL] Округлена ціна SL: {sl_price_rounded}")
+
             params = {
-                'stopPrice': stop_loss_price,
+                'stopPrice': sl_price_rounded,
                 'positionSide': position_side.upper(),
                 'workingType': 'MARK_PRICE'
-                # Видалено 'reduceOnly': True
             }
-            self.logger.debug(f"Параметри для create_order (SL): symbol={ccxt_market_symbol}, type={order_type}, side={sl_side}, amount={amount_to_set}, params={params}")
+            # --- Додано детальне логування ---
+            log_params = {
+                'symbol': ccxt_market_symbol,
+                'type': order_type,
+                'side': sl_side,
+                'amount': amount_to_set,
+                'price': None, # Ціна не потрібна для STOP_MARKET
+                'params': params
+            }
+            self.logger.debug(f"[SL] Параметри для відправки в exchange.create_order: {log_params}")
+            # --- Кінець доданого логування ---
 
             sl_order = self.exchange.create_order(
                 symbol=ccxt_market_symbol,
                 type=order_type,
                 side=sl_side,
                 amount=amount_to_set,
-                price=None,
+                price=None, # Ціна не потрібна для STOP_MARKET
                 params=params
             )
 
-            self.logger.info(f"[УСПІХ] Ордер Stop Loss успішно створено!")
-            self.logger.debug(f"Деталі SL ордеру: {sl_order}")
-            return sl_order
+            # --- Додано детальне логування результату ---
+            self.logger.debug(f"[SL] Результат від exchange.create_order: {sl_order}")
+            # --- Кінець доданого логування ---
 
-        except ccxt.InvalidOrder as e:
-            self.logger.error(f"[SL] Неприпустимий ордер SL для {ccxt_market_symbol}: {e}", exc_info=True)
-            return None
+            # Перевірка, чи ордер дійсно створено (деякі біржі можуть повертати None або [])
+            if sl_order and isinstance(sl_order, dict) and sl_order.get('id'):
+                self.logger.info(f"[УСПІХ] Ордер Stop Loss успішно створено!")
+                self.logger.debug(f"Деталі SL ордеру: {sl_order}")
+                return sl_order
+            else:
+                self.logger.error(f"[SL] Не вдалося створити ордер. Відповідь біржі: {sl_order}")
+                return None
+
         except ccxt.ExchangeError as e:
-            self.logger.error(f"[SL] Помилка біржі при створенні SL ордера для {ccxt_market_symbol}: {e}", exc_info=True)
+            self.logger.error(f"[SL] Помилка біржі: {e}", exc_info=True)
             return None
         except Exception as e:
-            self.logger.error(f"[SL] Невідома помилка при створенні SL ордера для {ccxt_market_symbol}: {e}", exc_info=True)
+            self.logger.error(f"[SL] Помилка: {e}", exc_info=True)
             return None
 
     def set_take_profits(self, symbol: str, position_side: str, initial_amount: float, 
@@ -388,8 +408,13 @@ class BingXClient:
             order_type = 'TAKE_PROFIT_MARKET'
             self.logger.info(f"[TP {i+1}] Спроба створити ордер: {tp_side.upper()} {amount_to_place_final} {base_currency} @ TP={tp_price}...")
             try:
+                # Округлюємо ціну TP до точності біржі
+                tp_price_str = self.exchange.price_to_precision(ccxt_market_symbol, tp_price)
+                tp_price_rounded = float(tp_price_str)
+                self.logger.info(f"[TP {i+1}] Округлена ціна TP: {tp_price_rounded}")
+
                 params = {
-                    'stopPrice': tp_price,
+                    'stopPrice': tp_price_rounded, # Використовуємо округлену ціну
                     'positionSide': position_side.upper(),
                     'workingType': 'MARK_PRICE',
                     # 'reduceOnly': True 
@@ -405,21 +430,26 @@ class BingXClient:
                     params=params
                 )
 
-                if tp_order:
-                    self.logger.info(f"[УСПІХ] Ордер TP {i+1} успішно створено! Обсяг: {amount_to_place_final}")
-                    created_tp_orders.append(tp_order)
-                    remaining_amount -= amount_to_place_final
-                else:
-                    self.logger.error(f"[TP {i+1}] Ордер TP для {ccxt_market_symbol} не було створено (повернуто None).")
-            
-            except ccxt.InsufficientFunds as e:
-                self.logger.error(f"[TP {i+1}] Недостатньо коштів для TP ордера {ccxt_market_symbol}: {e}")
-            except ccxt.ExchangeError as e:
-                self.logger.error(f"[TP {i+1}] Помилка біржі при створенні TP ордера {ccxt_market_symbol}: {e}")
-            except Exception as e:
-                self.logger.error(f"[TP {i+1}] Неочікувана помилка при створенні TP ордера {ccxt_market_symbol}: {e}", exc_info=True)
+                # --- Додано детальне логування результату ---
+                self.logger.debug(f"[TP {i+1}] Результат від exchange.create_order: {tp_order}")
+                # --- Кінець доданого логування ---
 
-        self.logger.info(f"-- Завершено встановлення TP ордерів. Створено: {len(created_tp_orders)}. Фінальний залишок: {remaining_amount:.8f} --")
+                # Перевірка, чи ордер дійсно створено
+                if tp_order and isinstance(tp_order, dict) and tp_order.get('id'):
+                    self.logger.info(f"[TP {i+1}] Ордер успішно створено.")
+                    created_tp_orders.append(tp_order)
+                else:
+                    self.logger.error(f"[TP {i+1}] Не вдалося створити ордер. Відповідь біржі: {tp_order}")
+                    # Продовжуємо з наступними ТП, навіть якщо один не вдалося створити
+
+            except ccxt.ExchangeError as e:
+                self.logger.error(f"[TP {i+1}] Помилка біржі при створенні TP: {e}", exc_info=True)
+                continue # Продовжуємо з наступним TP
+            except Exception as e:
+                self.logger.error(f"[TP {i+1}] Невідома помилка при створенні TP: {e}", exc_info=True)
+                continue # Продовжуємо з наступним TP
+
+        self.logger.info(f"-- Завершено встановлення Take Profits. Створено {len(created_tp_orders)}/{len(take_profit_prices)} ордерів --")
         return created_tp_orders
 
     def cancel_open_orders(self, symbol: str, order_ids: list):
@@ -617,6 +647,55 @@ class BingXClient:
             self.logger.error(f"[BingXClient] Невідома помилка при скасуванні ордера {order_id} для {ccxt_market_symbol}: {e}", exc_info=True)
             return False
 
+    def place_tp_order(self, symbol: str, position_side: str, tp_price: float, amount: float):
+        """Встановлює ордер Take Profit для існуючої позиції."""
+        if not self.exchange:
+            self.logger.error("[TP] Спроба викликати метод на неініціалізованому клієнті.")
+            return None
+
+        ccxt_market_symbol = self._format_symbol_for_swap(symbol)
+        tp_side = 'sell' if position_side.upper() == 'LONG' else 'buy'
+        self.logger.info(f"-- Встановлення Take Profit для {ccxt_market_symbol} --")
+        order_type = 'TAKE_PROFIT_MARKET'
+        self.logger.info(f"Параметри: Side={tp_side}, Amount={amount}, TP Price={tp_price}, Type={order_type}")
+
+        try:
+            amount_to_set = self._round_amount(amount, ccxt_market_symbol)
+            if amount_to_set is None or amount_to_set <= 0:
+                self.logger.error(f"[TP] Не вдалося округлити обсяг {amount} або результат нульовий/від'ємний: {amount_to_set}")
+                return None
+
+            self.logger.info(f"[TP] Округлений обсяг для встановлення: {amount_to_set}")
+            params = {
+                'stopPrice': tp_price,
+                'positionSide': position_side.upper(),
+                'workingType': 'MARK_PRICE'
+                # Видалено 'reduceOnly': True
+            }
+            self.logger.debug(f"Параметри для create_order (TP): symbol={ccxt_market_symbol}, type={order_type}, side={tp_side}, amount={amount_to_set}, params={params}")
+
+            tp_order = self.exchange.create_order(
+                symbol=ccxt_market_symbol,
+                type=order_type,
+                side=tp_side,
+                amount=amount_to_set,
+                price=None,
+                params=params
+            )
+
+            self.logger.info(f"[УСПІХ] Ордер Take Profit успішно створено!")
+            self.logger.debug(f"Деталі TP ордеру: {tp_order}")
+            return tp_order
+
+        except ccxt.InvalidOrder as e:
+            self.logger.error(f"[TP] Неприпустимий ордер TP для {ccxt_market_symbol}: {e}", exc_info=True)
+            return None
+        except ccxt.ExchangeError as e:
+            self.logger.error(f"[TP] Помилка біржі при створенні TP ордера для {ccxt_market_symbol}: {e}", exc_info=True)
+            return None
+        except Exception as e:
+            self.logger.error(f"[TP] Невідома помилка при створенні TP ордера для {ccxt_market_symbol}: {e}", exc_info=True)
+
 if __name__ == "__main__":
     # Налаштування логера
     log_format = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
@@ -703,8 +782,8 @@ if __name__ == "__main__":
         sl_order = client.set_stop_loss(
             symbol=symbol,
             position_side=direction,
-            initial_amount=market_amount,
-            stop_loss_price=stop_loss_price
+            sl_price=stop_loss_price,
+            amount=market_amount
         )
 
         if not sl_order:
@@ -764,8 +843,8 @@ if __name__ == "__main__":
             new_sl_order = client.set_stop_loss(
                 symbol=symbol,
                 position_side=direction,
-                initial_amount=total_amount,
-                stop_loss_price=stop_loss_price
+                sl_price=stop_loss_price,
+                amount=total_amount
             )
 
             if not new_sl_order:
