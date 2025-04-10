@@ -46,16 +46,11 @@ class BingXClient:
             raise
 
     def _format_symbol_for_swap(self, symbol: str) -> str:
-        """Конвертує символ типу 'BTCUSDT' у формат 'BTC/USDT:USDT' для ccxt swap."""
+        """Конвертує символ типу 'BTCUSDT' або '1000PEPEUSDT' у формат 'BASE/QUOTE:QUOTE' для ccxt swap."""
         quote_currencies_pattern = '(?:USDT|BUSD|USDC|BTC|ETH)'
         if re.match(f"^[A-Z0-9]+/{quote_currencies_pattern}:{quote_currencies_pattern}$", symbol):
             self.logger.debug(f"[_format_symbol_for_swap] Символ '{symbol}' вже у правильному форматі swap. Без змін.")
             return symbol
-
-        symbol_cleaned = re.sub(r'^\d+', '', symbol)
-        if symbol_cleaned != symbol:
-            self.logger.debug(f"[_format_symbol_for_swap] Видалено префікс з '{symbol}' -> '{symbol_cleaned}'")
-            symbol = symbol_cleaned
 
         quote_currencies = ['USDT', 'BUSD', 'USDC', 'BTC', 'ETH']
         for quote in quote_currencies:
@@ -296,7 +291,7 @@ class BingXClient:
             params = {
                 'stopPrice': sl_price_rounded,
                 'positionSide': position_side.upper(),
-                'workingType': 'MARK_PRICE'
+                'workingType': 'MARK_PRICE',
             }
             # --- Додано детальне логування ---
             log_params = {
@@ -340,7 +335,7 @@ class BingXClient:
             return None
 
     def set_take_profits(self, symbol: str, position_side: str, initial_amount: float, 
-                         take_profit_prices: list[float], tp_distribution: list[int]):
+                         take_profit_prices: list[float], tp_distribution: list[float]):
         """Встановлює ордери Take Profit для часткового закриття позиції."""
         if not self.exchange:
             self.logger.error("[TP] Спроба викликати метод на неініціалізованому клієнті.")
@@ -375,25 +370,34 @@ class BingXClient:
 
             percentage = tp_distribution[i]
             if percentage <= 0:
-                self.logger.info(f"[TP {i+1}] Пропуск рівня TP з розподілом {percentage}%.")
+                self.logger.info(f"[TP {i+1}] Пропуск рівня TP з розподілом {percentage*100.0}%.")
                 continue
 
-            target_partial_amount = initial_amount * (percentage / 100.0)
-            self.logger.info(f"[TP {i+1}] Ціна={tp_price}, Відсоток={percentage}%, Цільовий обсяг={target_partial_amount:.8f} {base_currency}")
+            # Визначаємо обсяг для поточного TP
+            is_last_tp = (i == len(take_profit_prices) - 1)
+            if is_last_tp:
+                # Для останнього TP використовуємо весь залишок
+                target_partial_amount = remaining_amount
+                self.logger.info(f"[TP {i+1} Last] Ціна={tp_price}, Використовуємо залишок: {target_partial_amount:.8f} {base_currency}")
+            else:
+                # Для проміжних TP розраховуємо відсоток від початкового
+                target_partial_amount = initial_amount * percentage 
+                self.logger.info(f"[TP {i+1}] Ціна={tp_price}, Відсоток={percentage*100.0:.1f}%, Цільовий обсяг={target_partial_amount:.8f} {base_currency}")
 
             amount_to_place_rounded = self._round_amount(target_partial_amount, ccxt_market_symbol)
             if amount_to_place_rounded is None or amount_to_place_rounded <= 0:
-                self.logger.error(f"[TP {i+1}] Не вдалося округлити цільовий обсяг або результат нульовий/від'ємний: {amount_to_place_rounded}")
-                continue
+                self.logger.error(f"[TP {i+1}] Не вдалося округлити цільовий обсяг ({target_partial_amount}) або результат нульовий/від'ємний: {amount_to_place_rounded}")
+                # Якщо це останній TP і округлення не вдалося, це проблема
+                if is_last_tp:
+                     self.logger.error(f"[TP {i+1} Last] Не вдалося округлити залишок! Можлива помилка з частковим закриттям.")
+                     # Можна спробувати скасувати попередні TP або просто вийти
+                     break # Зупиняємо обробку ТП
+                else:
+                     continue # Пропускаємо цей ТП
 
-            remaining_amount_rounded = self._round_amount(remaining_amount, ccxt_market_symbol)
-            if remaining_amount_rounded is None:
-                self.logger.error(f"[TP {i+1}] Не вдалося округлити залишок {remaining_amount}. Пропуск TP.")
-                continue
-
-            if amount_to_place_rounded > remaining_amount_rounded:
-                self.logger.warning(f"[TP {i+1}] Округлений цільовий обсяг ({amount_to_place_rounded}) більший за округлений залишок ({remaining_amount_rounded}). Використовуємо залишок.")
-                amount_to_place_final = remaining_amount_rounded
+            if amount_to_place_rounded > remaining_amount:
+                self.logger.warning(f"[TP {i+1}] Округлений цільовий обсяг ({amount_to_place_rounded}) більший за округлений залишок ({remaining_amount}). Використовуємо залишок.")
+                amount_to_place_final = remaining_amount
             else:
                 amount_to_place_final = amount_to_place_rounded
 
@@ -414,10 +418,9 @@ class BingXClient:
                 self.logger.info(f"[TP {i+1}] Округлена ціна TP: {tp_price_rounded}")
 
                 params = {
-                    'stopPrice': tp_price_rounded, # Використовуємо округлену ціну
+                    'stopPrice': tp_price_rounded,
                     'positionSide': position_side.upper(),
                     'workingType': 'MARK_PRICE',
-                    # 'reduceOnly': True 
                 }
                 self.logger.debug(f"Параметри для create_order (TP {i+1}): symbol={ccxt_market_symbol}, type={order_type}, side={tp_side}, amount={amount_to_place_final}, params={params}")
 
@@ -430,17 +433,22 @@ class BingXClient:
                     params=params
                 )
 
-                # --- Додано детальне логування результату ---
                 self.logger.debug(f"[TP {i+1}] Результат від exchange.create_order: {tp_order}")
-                # --- Кінець доданого логування ---
-
-                # Перевірка, чи ордер дійсно створено
+                
                 if tp_order and isinstance(tp_order, dict) and tp_order.get('id'):
                     self.logger.info(f"[TP {i+1}] Ордер успішно створено.")
                     created_tp_orders.append(tp_order)
+                    # Зменшуємо залишок тільки після успішного створення ордера
+                    remaining_amount -= amount_to_place_final
+                    self.logger.debug(f"[TP {i+1}] Новий залишок: {remaining_amount:.8f}")
                 else:
                     self.logger.error(f"[TP {i+1}] Не вдалося створити ордер. Відповідь біржі: {tp_order}")
-                    # Продовжуємо з наступними ТП, навіть якщо один не вдалося створити
+                    # Якщо останній TP не вдалося створити, це проблема
+                    if is_last_tp:
+                         self.logger.error(f"[TP {i+1} Last] Не вдалося створити ордер для закриття залишку! Ручне втручання може бути необхідним.")
+                         # Тут також можна скасувати попередні ТП
+                         break
+                    # Для проміжних - просто продовжуємо
 
             except ccxt.ExchangeError as e:
                 self.logger.error(f"[TP {i+1}] Помилка біржі при створенні TP: {e}", exc_info=True)
@@ -628,25 +636,33 @@ class BingXClient:
         self.logger.info(f"[BingXClient] Спроба скасувати ордер ID: {order_id} для {ccxt_market_symbol}...")
         
         try:
-            # ccxt.cancel_order повертає інформацію про скасований ордер або None/undefined
-            # BingX може вимагати символ, навіть якщо ID унікальний
-            result = self.exchange.cancel_order(order_id, ccxt_market_symbol) 
-            self.logger.info(f"[BingXClient] Ордер {order_id} успішно скасовано (або вже був неактивний).")
-            self.logger.debug(f"Результат скасування для {order_id}: {result}")
-            # Повертаємо True для індикації успіху (навіть якщо ордер вже був закритий/скасований)
-            # Якщо була помилка (напр., OrderNotFound), ccxt кине виняток
-            return True 
+            result = self.exchange.cancel_order(order_id, ccxt_market_symbol)
+            # BingX API for swap cancellation returns data directly, not status. 
+            # We assume success if no exception is raised.
+            # Let's check if 'result' has orderId to be more sure (though API docs are unclear)
+            if result and isinstance(result, dict) and result.get('orderId') == order_id:
+                 self.logger.info(f"[BingXClient] Ордер {order_id} для {ccxt_market_symbol} успішно скасовано (за відповіддю API).")
+                 return True
+            else:
+                 # This path might be taken if cancel_order for BingX returns something unexpected
+                 self.logger.warning(f"[BingXClient] Скасування ордера {order_id} для {ccxt_market_symbol} не повернуло очікуваної відповіді, але й не викликало помилки. Відповідь: {result}. Вважаємо успішним.")
+                 # Consider it a success if no exception was raised, as per some exchange behaviors
+                 return True
+                 
         except ccxt.OrderNotFound as e:
-            # Ордер вже не існує (був виконаний або скасований раніше) - це НЕ помилка для нас
-            self.logger.warning(f"[BingXClient] Ордер {order_id} ({ccxt_market_symbol}) не знайдено під час скасування (можливо, вже закритий): {e}")
-            return True # Вважаємо успіхом, бо ордера більше немає
+            # Specific handling for OrderNotFound
+            self.logger.warning(f"[BingXClient] Помилка 'Order not found' при скасуванні ордера {order_id} для {ccxt_market_symbol}: {e}")
+            # Consider it 'canceled' for the purpose of proceeding in Position Manager
+            raise e # <--- RE-RAISE THE EXCEPTION
         except ccxt.ExchangeError as e:
-            self.logger.error(f"[BingXClient] Помилка біржі при скасуванні ордера {order_id} для {ccxt_market_symbol}: {e}", exc_info=True)
-            return False
+            # Catch other exchange errors
+            self.logger.error(f"[BingXClient] Помилка біржі при скасуванні ордера {order_id} для {ccxt_market_symbol}: {e}")
+            raise e # <--- RE-RAISE THE EXCEPTION
         except Exception as e:
-            self.logger.error(f"[BingXClient] Невідома помилка при скасуванні ордера {order_id} для {ccxt_market_symbol}: {e}", exc_info=True)
-            return False
-
+            # Catch any other unexpected errors
+            self.logger.error(f"[BingXClient] Неочікувана помилка при скасуванні ордера {order_id} для {ccxt_market_symbol}: {e}", exc_info=True)
+            raise e # <--- RE-RAISE THE EXCEPTION
+            
     def place_tp_order(self, symbol: str, position_side: str, tp_price: float, amount: float):
         """Встановлює ордер Take Profit для існуючої позиції."""
         if not self.exchange:
@@ -669,8 +685,7 @@ class BingXClient:
             params = {
                 'stopPrice': tp_price,
                 'positionSide': position_side.upper(),
-                'workingType': 'MARK_PRICE'
-                # Видалено 'reduceOnly': True
+                'workingType': 'MARK_PRICE',
             }
             self.logger.debug(f"Параметри для create_order (TP): symbol={ccxt_market_symbol}, type={order_type}, side={tp_side}, amount={amount_to_set}, params={params}")
 

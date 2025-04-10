@@ -7,32 +7,31 @@
   "channels": {
     "channel_1": {
       "name": "VIP марафон | Даниэль",
-      "entry_percentage": 5,
-      "tp_distribution": [30, 50, 20],
-      "leverage": 10
+      "entry_percentage": 10,
+      "tp_distribution": [0.3, 0.5, 0.2],
+      "leverage": 25
     },
     "channel_2": {
       "name": "Crypto Alliance | Мартин",
-      "entry_percentage": 5,
-      "tp_distribution": [30, 50, 20],
-      "leverage": 10
-    },
-    "channel_3": {
-      "name": "Внутри графика с Джимми",
-      "entry_percentage": 4,
-      "tp_distribution": [70, 30],
-      "max_open_positions": 3,
-      "leverage": 5
+      "entry_percentage": 10,
+      "tp_distribution": [0.3, 0.5, 0.2],
+      "leverage": 25
     },
     "channel_4": {
       "name": "KostyaKogan",
+      "entry_percentage": 4,
+      "tp_distribution": [0.4, 0.4, 0.2],
+      "leverage": 20
+    },
+    "channel_5": {
+      "name": "VALERIY LONG/SHORT",
       "entry_percentage": 5,
-      "tp_distribution": [40, 40, 20],
-      "leverage": 18
+      "tp_distribution": [0.35, 0.35, 0.3],
+      "leverage": 20
     }
   },
   "position_limits": {
-    "group_1_2_4_max_open": 2
+    "total_max_open": 3
   },
   "notifications": {
     "telegram_bot_token": "YOUR_BOT_TOKEN",

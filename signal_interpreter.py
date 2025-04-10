@@ -320,32 +320,33 @@ def parse_channel_3(text: str, config: dict):
         logger.error(f"  [C3] Неочікувана помилка під час парсингу каналу 3: {e}", exc_info=True)
         return None
 
+# --- Parser for Channel 4 (KostyaKogan - одноетапний) ---
 def parse_channel_4(text: str, config: dict):
-    """Парсер для каналу 4 (KostyaKogan)."""
-    logger.info(f"Викликано парсер для каналу 4 ({config['channels']['channel_4']['name']}).")
+    """Парсер для каналу 4 (KostyaKogan), який надсилає все в одному повідомленні."""
+    logger.debug("  [C4] Спроба парсингу як одноетапного сигналу")
     signal_data = {
-        "type": "full",
+        "type": "full", # Позначаємо як повний сигнал
         "source": "channel_4",
-        "source_name": config['channels']['channel_4']['name'],
+        "source_name": config.get('channels', {}).get('channel_4', {}).get('name', 'KostyaKogan'),
         "pair": None,
         "direction": None,
-        "entry_price": "MARKET", # Явно вказуємо ринковий вхід
+        "entry_price": "MARKET", # Вхід по ринку
         "take_profits": [],
         "stop_loss": None,
-        "leverage": None, # Додаткове поле для плеча
+        "leverage": None, # Додаємо поле для плеча
         "raw_text": text,
     }
 
     try:
-        # 1. Пара та напрямок (Шукаємо в першому рядку)
+        # 1. Пара та Напрямок (Шукаємо в першому рядку типу "Открыл UXLINK long")
         first_line = text.splitlines()[0] if text.splitlines() else ""
-        pair_match = re.search(r"([A-Z]{3,})\s+(long|short)", first_line, re.IGNORECASE)
+        pair_match = re.search(r"Открыл\s+([A-Z0-9]+)\s+(long|short)", first_line, re.IGNORECASE)
         if pair_match:
             signal_data["pair"] = normalize_pair(pair_match.group(1))
             signal_data["direction"] = pair_match.group(2).upper()
             logger.debug(f"  [C4] Знайдено пару: {signal_data['pair']}, напрямок: {signal_data['direction']}")
         else:
-            logger.warning("  [C4] Не вдалося знайти пару та напрямок у першому рядку.")
+            logger.warning("  [C4] Не вдалося знайти пару та напрямок у першому рядку ('Открыл...').")
             return None # Обов'язкові
 
         # 2. Плече (опціонально)
@@ -359,7 +360,7 @@ def parse_channel_4(text: str, config: dict):
         else:
              logger.debug("  [C4] Плече не знайдено.")
 
-        # 3. Стоп-лосс (Ключове слово з маленької літери!)
+        # 3. Стоп-лосс
         sl_match = re.search(r"стоп:\s*([\d.,]+)", text, re.IGNORECASE)
         if sl_match:
             signal_data["stop_loss"] = safe_float(sl_match.group(1))
@@ -368,16 +369,15 @@ def parse_channel_4(text: str, config: dict):
             logger.warning("  [C4] Не вдалося знайти стоп-лосс ('стоп:...').")
             return None # Обов'язкове
 
-        # 4. Тейк-профіти (Ключове слово з маленької! Роздільник ", ")
+        # 4. Тейк-профіти (Роздільник ", ")
         tp_match = re.search(r"тейк:\s*(.+)", text, re.IGNORECASE)
         if tp_match:
             tp_str = tp_match.group(1).strip()
-            # Розділяємо по ", ", очищуємо від пробілів, конвертуємо
             signal_data["take_profits"] = [p for p in (safe_float(val.strip()) for val in tp_str.split(',')) if p is not None]
             logger.debug(f"  [C4] Знайдено тейк-профіти: {signal_data['take_profits']}")
         else:
             logger.warning("  [C4] Не вдалося знайти тейк-профіти ('тейк:...').")
-            # Тейки можуть бути необов'язковими
+            # Тейки тут, схоже, обов'язкові?
 
         # Перевірка обов'язкових полів
         if not all([signal_data["pair"], signal_data["direction"], signal_data["stop_loss"]]):
@@ -389,4 +389,77 @@ def parse_channel_4(text: str, config: dict):
 
     except Exception as e:
         logger.error(f"  [C4] Неочікувана помилка під час парсингу каналу 4: {e}", exc_info=True)
+        return None
+
+# --- Parser for Channel 5 (VALERIY LONG/SHORT) --- 
+
+def parse_channel_5_entry(text: str):
+    """Парсер для ПЕРШОГО повідомлення каналу 5 ('Захожу...')."""
+    logger.debug("  [C5 Entry] Спроба парсингу як повідомлення 'Захожу...'")
+    # Патерн: "Захожу" + пробіл + (в LONG / в SHORT) + "по монете" + пробіл + (#Символ) + ...
+    # Додаємо # до символу і робимо його необов'язковим, шукаємо великі літери + USDT
+    match = re.search(r"Захожу\s+(?:в\s+)?(LONG|SHORT)\s+по\s+монете\s+#?([A-Z0-9/]+USDT)", text, re.IGNORECASE)
+    if match:
+        direction = match.group(1).upper()
+        pair_raw = match.group(2) # Вже має містити USDT
+        pair = normalize_pair(pair_raw)
+        logger.info(f"  [C5 Entry] Розпізнано вхідний сигнал: Pair={pair}, Direction={direction}")
+        return {"type": "entry", "pair": pair, "direction": direction}
+    logger.debug("  [C5 Entry] Не знайдено патерн 'Захожу...'")
+    return None
+
+def parse_channel_5_details(text: str, config: dict):
+    """Парсер для ДРУГОГО повідомлення каналу 5 (з деталями TP/SL)."""
+    logger.debug("  [C5 Details] Спроба парсингу як повідомлення з деталями (COIN...) ")
+    logger.debug(f"  [C5 Details] Вхідний текст для парсингу пари: {repr(text[:100])}...") # Логуємо перші 100 символів
+    signal_data = {
+        "type": "details",
+        "source": "channel_5",
+        "source_name": config.get('channels', {}).get('channel_5', {}).get('name', 'VALERIY LONG/SHORT'),
+        "pair": None,
+        "direction": None, # Залишаємо None, буде встановлено в main.py
+        "entry_price": "MARKET", # Вхід по ринку
+        "take_profits": [],
+        "stop_loss": None,
+        "raw_text": text,
+    }
+
+    try:
+        # 1. Пара (з рядка \"COIN...\") - Одинарний слеш для пробілу!
+        pair_match = re.search(r"COIN\s*🪙?\s*([A-Z0-9/]+USDT)", text, re.IGNORECASE) # <-- Одинарний \s
+        if pair_match:
+            signal_data["pair"] = normalize_pair(pair_match.group(1))
+            logger.debug(f"  [C5 Details] Знайдено пару: {signal_data['pair']} (з {pair_match.group(1)})")
+        else:
+            logger.warning("  [C5 Details] Не вдалося знайти пару ('COIN...XXXUSDT').")
+            return None # Обов'язкове поле
+
+        # 2. Тейк-профіти (Шукаємо рядки, що починаються з ✅TP:) - Одинарний слеш!
+        tp_lines = re.findall(r"✅\s*TP:\s*([\d.,]+)", text) # <-- Одинарний \s
+        if tp_lines:
+            signal_data["take_profits"] = [p for p in (safe_float(val) for val in tp_lines) if p is not None]
+            logger.debug(f"  [C5 Details] Знайдено тейк-профіти: {signal_data['take_profits']}")
+        else:
+            logger.warning("  [C5 Details] Не вдалося знайти тейк-профіти (рядки ✅TP:).")
+            # TP можуть бути необов'язковими?
+
+        # 3. Стоп-лосс (Шукаємо рядок "🚫Stop ...") - Одинарний слеш!
+        sl_match = re.search(r"🚫\s*Stop\s+([\d.,]+)", text, re.IGNORECASE) # <-- Одинарний \s
+        if sl_match:
+            signal_data["stop_loss"] = safe_float(sl_match.group(1))
+            logger.debug(f"  [C5 Details] Знайдено стоп-лосс: {signal_data['stop_loss']}")
+        else:
+            logger.warning("  [C5 Details] Не вдалося знайти стоп-лосс ('🚫Stop...').")
+            return None # Обов'язкове поле
+
+        # Перевірка обов'язкових полів (без напрямку)
+        if not all([signal_data["pair"], signal_data["stop_loss"]]):
+             logger.warning("  [C5 Details] Не всі обов'язкові поля (pair, stop_loss) було розпізнано.")
+             return None
+
+        logger.info(f"  [C5 Details] Розпізнано деталі сигналу (без напрямку): { {k: v for k, v in signal_data.items() if k != 'raw_text'} }")
+        return signal_data # Повертаємо дані без напрямку
+
+    except Exception as e:
+        logger.error(f"  [C5 Details] Неочікувана помилка під час парсингу деталей каналу 5: {e}", exc_info=True)
         return None 

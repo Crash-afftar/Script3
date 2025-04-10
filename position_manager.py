@@ -183,98 +183,149 @@ class PositionManager:
         remaining_amount = current_amount # Поточний залишок позиції
         closed_tp_ids = [] # Список ID TP, які спрацювали в цьому циклі
         all_tp_closed_or_irrelevant = True # Флаг, що всі TP або закриті, або їх немає
+        any_tp_filled_or_closed = False # Флаг, що хоча б один TP спрацював/закрився
 
         if not tp_order_ids:
-             all_tp_closed_or_irrelevant = True
+            all_tp_closed_or_irrelevant = True
         else:
             for tp_id in tp_order_ids:
                 tp_info = tp_orders_info.get(tp_id)
                 tp_status = tp_info.get('status') if tp_info else 'unknown'
-                tp_filled = tp_info.get('filled', 0) if tp_info else 0
-                
-                if tp_status == 'closed' and tp_filled > 0:
-                    # Цей TP спрацював
-                    self.logger.info(f"[PositionManager] Take Profit (ID: {tp_id}) для позиції {position_id} ({symbol}) виконано. Обсяг: {tp_filled}")
+                # ВАЖЛИВО: Використовуємо amount ордера для розрахунку зменшення,
+                # оскільки filled може бути 0 для закритих TP_MARKET ордерів
+                tp_order_amount = tp_info.get('amount', 0) if tp_info else 0
+
+                # Вважаємо TP спрацьованим, якщо він 'closed' (або 'FILLED' в API)
+                if tp_status == 'closed':
+                    self.logger.info(f"[PositionManager] Take Profit (ID: {tp_id}) для позиції {position_id} ({symbol}) має статус 'closed'. Обсяг ордера: {tp_order_amount}")
                     closed_tp_ids.append(tp_id)
-                    remaining_amount -= tp_filled # Зменшуємо залишок позиції
-                    # TODO: Потрібно перевірити, чи є цей TP першим, і якщо так, перевести в ББ
-                    # Припускаємо, що перший ID у списку tp_order_ids - це TP1
-                    is_tp1 = (tp_id == tp_order_ids[0])
-                    
-                    if not is_breakeven and is_tp1:
-                        self.logger.info(f"[PositionManager] TP1 (ID: {tp_id}) виконано для позиції {position_id}. Переводимо SL в ББ (ціна: {entry_price})...")
-                        
-                        # --- Спроба модифікації SL --- 
-                        # Використовуємо edit_order з bingx_client
-                        edited_sl_order = self.bingx_api.edit_order(symbol=symbol, order_id=sl_order_id, new_price=entry_price)
-                        
-                        if edited_sl_order:
-                            self.logger.info(f"[PositionManager] SL для позиції {position_id} успішно переведено в ББ. Новий ID (якщо змінився): {edited_sl_order.get('id')}")
-                            # Оновлюємо статус в БД (передаємо db_conn)
-                            db_update_ok = data_manager.update_position_breakeven(db_conn, position_id, True)
-                            if db_update_ok and sl_order_id != position_data['sl_order_id']:
-                                 # Передаємо db_conn
-                                 data_manager._update_position_field(db_conn, position_id, 'sl_order_id', sl_order_id)
-                                 sl_order_id = edited_sl_order.get('id') # Оновлюємо локальну змінну для подальших перевірок
-                                 
-                            # Звільняємо слот (якщо канал 1, 2 або 4)
-                            if source_channel_key in ['channel_1', 'channel_2', 'channel_4']:
-                                self._release_trading_slot(source_channel_key, position_id)
-                                
-                            # --- Логіка для Каналу 3: Скасування лімітного ордера --- 
-                            if source_channel_key == 'channel_3' and limit_order_id_c3:
-                                self.logger.info(f"[PositionManager C3] TP1 виконано, скасування лімітного ордера ID: {limit_order_id_c3}...")
-                                self._cancel_related_limit_order(symbol, limit_order_id_c3, position_id, db_conn)
-                                limit_order_id_c3 = None # Оновлюємо локальну змінну
-                                
-                        else:
-                            self.logger.error(f"[PositionManager] Не вдалося перевести SL в ББ для позиції {position_id}. Спроба редагування SL {sl_order_id} не вдалася.")
-                            # TODO: Додати логіку Cancel+Create як альтернативу?
-                            
-                        # Оновлюємо флаг is_breakeven локально, щоб не намагатись знову в цьому циклі
-                        is_breakeven = True # Навіть якщо редагування не вдалося, вважаємо, що спроба була
-                        
-                elif tp_status not in ['closed', 'canceled']:
-                     # Якщо хоча б один TP ще не закритий/скасований, то позиція ще не повністю закрита по TP
-                     all_tp_closed_or_irrelevant = False
+                    # Зменшуємо залишок на обсяг *цього* TP ордера
+                    if tp_order_amount > 0:
+                         remaining_amount -= tp_order_amount
+                    any_tp_filled_or_closed = True # Зафіксували спрацювання/закриття TP
+                elif tp_status == 'open' or tp_status == 'new':
+                    # Якщо хоча б один TP ще відкритий, то не всі закриті
+                    all_tp_closed_or_irrelevant = False
+                # Інші статуси ('canceled', 'expired', 'rejected', 'unknown') ігноруємо для розрахунку remaining_amount,
+                # але вони не заважають all_tp_closed_or_irrelevant стати True, якщо немає активних.
 
-        # --- Оновлення поточного обсягу в БД, якщо були виконані TP --- 
-        if closed_tp_ids: # Якщо хоча б один TP спрацював
-             # Перевіряємо, чи залишився обсяг > 0 (з урахуванням можливих похибок float)
-             if remaining_amount > 1e-9: # Використовуємо мале число замість 0
-                 self.logger.info(f"[PositionManager] Оновлення поточного обсягу для позиції {position_id} на {remaining_amount:.8f}")
-                 data_manager.update_position_amount(db_conn, position_id, remaining_amount)
-             else:
-                 # Якщо обсяг став нульовим або від'ємним, вважаємо позицію закритою по TP
-                 self.logger.info(f"[PositionManager] Розрахунковий залишок обсягу для позиції {position_id} <= 0 ({remaining_amount:.8f}). Вважаємо закритою по TP.")
-                 all_tp_closed_or_irrelevant = True # Примусово ставимо флаг
-                 # Закриваємо позицію в БД
-                 # Збираємо інформацію про всі TP для логування
-                 closed_tp_info = {tp_id: tp_orders_info.get(tp_id) for tp_id in tp_order_ids if tp_orders_info.get(tp_id)}
-                 self._handle_position_closed(position_id, 'all_tp_hit_calculated', position_data, db_conn, {"tp_orders": closed_tp_info})
-                 return
+        # Захист від від'ємного залишку через можливі неточності
+        remaining_amount = max(0, remaining_amount)
 
-        # --- Перевірка повного закриття по TP (якщо SL не спрацював раніше) --- 
-        if all_tp_closed_or_irrelevant and not closed_tp_ids: # Додаткова перевірка, якщо remaining_amount не став 0
-             # Це може статися, якщо всі TP були скасовані, або їх не було взагалі
-             # В цьому випадку позиція НЕ закрита, якщо тільки SL не спрацював
-             pass # Просто продовжуємо моніторинг SL
-        elif all_tp_closed_or_irrelevant and closed_tp_ids:
-             # Якщо всі TP були позначені як closed/canceled І хоча б один спрацював (remaining_amount оброблено вище) 
-             # АБО якщо remaining_amount став <= 0
-             # То позиція закрита по TP.
-             # Функція _handle_position_closed вже викликана вище, якщо remaining_amount <=0
-             # Якщо ж remaining_amount > 0, але всі ордери closed/canceled, потрібна додаткова логіка
-             # (наприклад, скасувати SL і закрити позицію вручну, якщо біржа не закрила її автоматично)
-             # Поки що вважаємо, що якщо remaining_amount > 0, то вона ще активна.
-             if remaining_amount > 1e-9:
-                  self.logger.warning(f"[PositionManager] Всі TP ордери для позиції {position_id} закриті/скасовані, але розрахунковий залишок > 0 ({remaining_amount:.8f}). Позиція може бути ще активна. Потрібен контроль.")
-                  # TODO: Додати логіку перевірки позиції на біржі та можливого ручного закриття залишку.
-             else:
-                  # Цей випадок вже оброблено вище (коли remaining_amount став <=0)
-                  pass 
-        
-        # Якщо ми дійшли сюди, позиція все ще активна (або сталася помилка)
+        # Оновлюємо поточний обсяг в БД, якщо були закриття TP (closed_tp_ids не порожній)
+        if closed_tp_ids:
+            # Оновлюємо тільки якщо розрахунковий remaining_amount відрізняється від поточного в БД
+            # Порівняння float потребує обережності
+            if abs(current_amount - remaining_amount) > 1e-9: # Якщо є зміна
+                # Переконуємось, що функція update_position_amount існує
+                update_amount_ok = data_manager.update_position_amount(db_conn, position_id, remaining_amount)
+                if update_amount_ok:
+                     self.logger.info(f"[PositionManager] Оновлено current_amount для позиції {position_id} на {remaining_amount:.8f}")
+                else:
+                     self.logger.error(f"[PositionManager] Не вдалося оновити current_amount для позиції {position_id}!")
+            else:
+                 self.logger.debug(f"[PositionManager] Розрахунковий remaining_amount ({remaining_amount:.8f}) не змінився суттєво порівняно з БД ({current_amount:.8f}). Оновлення БД не потрібне.")
+
+        # --- Переміщення SL в БЕЗЗБИТОК --- 
+        # Умови: SL ще не в ББ, хоча б один TP закрився, SL ордер ще активний
+        if not is_breakeven and any_tp_filled_or_closed and (sl_status == 'open' or sl_status == 'new'):
+            self.logger.info(f"[PositionManager] Спрацював TP для позиції {position_id}. Переміщення SL в ББ (ціна: {entry_price})...")
+
+            # --- Логіка Cancel + Create SL --- 
+            old_sl_order_id = sl_order_id # Зберігаємо старий ID для скасування
+            new_sl_order = None
+            new_sl_order_id_str = None
+            cancel_success = False
+            new_sl_success = False
+
+            # 1. Скасувати старий SL
+            if old_sl_order_id:
+                self.logger.info(f"[PM ББ] Скасування старого SL ордера ID: {old_sl_order_id}...")
+                try:
+                    cancel_success = self.bingx_api.cancel_order(symbol, old_sl_order_id)
+                    if cancel_success:
+                        self.logger.info(f"[PM ББ] Старий SL ордер {old_sl_order_id} скасовано.")
+                    else:
+                        # Якщо cancel_order повернув False без помилки (малоймовірно, але можливо)
+                        self.logger.error(f"[PM ББ] Функція cancel_order повернула False для SL {old_sl_order_id}, але не викликала помилку.")
+                        cancel_success = False # Явно ставимо False
+                except Exception as cancel_err:
+                    # Перевіряємо, чи це помилка 'order not exist' від BingX
+                    error_code = getattr(cancel_err, 'code', None) # ccxt може додавати код помилки
+                    error_message = str(cancel_err).lower()
+                    # Код 109414 - 'order not exist' для BingX Swap V2
+                    if error_code == 109414 or 'order not exist' in error_message:
+                        self.logger.warning(f"[PM ББ] Не вдалося скасувати старий SL ордер {old_sl_order_id}: він вже не існує (або виконаний/скасований). Вважаємо це успішним скасуванням для цілей ББ.")
+                        cancel_success = True # Вважаємо, що мета досягнута
+                    else:
+                        # Інша, неочікувана помилка
+                        self.logger.error(f"[PM ББ] Не вдалося скасувати старий SL ордер {old_sl_order_id} для позиції {position_id} через неочікувану помилку: {cancel_err}", exc_info=True)
+                        cancel_success = False # Скасування не вдалося
+            else:
+                 self.logger.warning(f"[PM ББ] Немає ID старого SL для скасування позиції {position_id}.")
+                 # Якщо старого SL немає, все одно пробуємо створити новий
+                 cancel_success = True 
+
+            # 2. Створити новий SL в ББ (тільки якщо скасування вдалося або не було потрібно)
+            if cancel_success:
+                # Використовуємо залишковий обсяг `remaining_amount`
+                if remaining_amount > 1e-9: # Перевіряємо, чи є що захищати
+                    self.logger.info(f"[PM ББ] Створення нового SL ордера в ББ ({entry_price}) для залишку {remaining_amount:.8f}...")
+                    new_sl_order = self.bingx_api.set_stop_loss(
+                        symbol=symbol, 
+                        position_side=position_data['position_side'], 
+                        sl_price=entry_price, 
+                        amount=remaining_amount
+                    )
+                    if new_sl_order and new_sl_order.get('id'):
+                        new_sl_order_id_str = str(new_sl_order.get('id')) # Перетворюємо на рядок
+                        self.logger.info(f"[PM ББ] Новий SL ордер успішно створено. ID: {new_sl_order_id_str}")
+                        new_sl_success = True
+                    else:
+                         self.logger.error(f"[PM ББ] Не вдалося створити новий SL ордер в ББ для позиції {position_id}. Відповідь: {new_sl_order}")
+                else:
+                    self.logger.warning(f"[PM ББ] Залишок позиції {position_id} ({remaining_amount:.8f}) занадто малий для створення нового SL в ББ.")
+                    # Вважаємо операцію ББ умовно успішною, бо позиція майже закрита, старий SL скасовано.
+                    new_sl_success = True 
+                    new_sl_order_id_str = 'None' # Немає нового ID
+                        
+            # 3. Оновити БД, якщо все вдалося (скасування + створення нового SL або підтвердження малого залишку)
+            if cancel_success and new_sl_success:
+                self.logger.info(f"[PM ББ] Оновлення даних позиції {position_id} в БД (новий SL ID: {new_sl_order_id_str}, is_breakeven: 1)...")
+                # Використовуємо нову функцію для оновлення обох полів одночасно
+                update_ok = data_manager.update_position_sl_and_breakeven(db_conn, position_id, new_sl_order_id_str, 1)
+                
+                if update_ok:
+                    self.logger.info(f"[PM ББ] Дані позиції {position_id} успішно оновлено в БД.")
+                    # Оновлюємо локальні змінні для подальшої логіки в цьому циклі
+                    sl_order_id = new_sl_order_id_str 
+                    is_breakeven = True 
+                else:
+                    self.logger.error(f"[PM ББ] Не вдалося оновити дані позиції {position_id} в БД!")
+                    # Критична помилка? Що робити? Можливо, спробувати ще раз в наступній ітерації?
+                    # Поки що просто логуємо.
+            else:
+                 self.logger.error(f"[PM ББ] Пропуск оновлення БД для позиції {position_id}, оскільки не всі кроки ББ були успішними (cancel_success={cancel_success}, new_sl_success={new_sl_success}).")
+
+        # --- Перевірка повного закриття позиції по TP --- 
+        # Якщо залишився дуже малий обсяг АБО всі TP ордери мають статус closed/canceled
+        if remaining_amount < 1e-9 or all_tp_closed_or_irrelevant:
+            # Перевіряємо, чи дійсно всі TP закриті, чи просто їх не було
+            all_tps_processed = True
+            if tp_order_ids: # Якщо TP були
+                for tp_id in tp_order_ids:
+                    tp_info = tp_orders_info.get(tp_id)
+                    tp_status = tp_info.get('status') if tp_info else 'unknown'
+                    if tp_status not in ['closed', 'canceled', 'filled']: # 'filled' може бути для ринкових TP
+                        all_tps_processed = False
+                        break
+
+            if remaining_amount < 1e-9 or all_tps_processed:
+                 self.logger.info(f"[PositionManager] Позиція ID={position_id} ({symbol}) повністю закрита по Take Profit(s). Залишок: {remaining_amount:.8f}")
+                 self._handle_position_closed(position_id, 'all_tp_hit', position_data, db_conn, None) # Передаємо None, бо закриття по TP може бути через кілька ордерів
+                 return # Позиція закрита
+
+        # Якщо ми дійшли сюди, позиція все ще активна
         self.logger.debug(f"[PositionManager] Перевірку позиції {position_id} ({symbol}) завершено, позиція активна.")
 
     def _handle_position_closed(self, position_id: int, reason: str, position_data: Dict[str, Any], db_conn: sqlite3.Connection, closing_info: Optional[Dict[str, Any]] = None):

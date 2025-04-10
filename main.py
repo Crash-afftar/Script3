@@ -1,5 +1,6 @@
 # Main application entry point and coordinator 
 import logging
+import logging.handlers # <-- Додаємо імпорт для ротації
 import json
 import os
 import sys # Додано
@@ -24,13 +25,13 @@ from position_manager import PositionManager
 from typing import Optional
 
 # --- Глобальні змінні --- 
-# db_conn: Optional[sqlite3.Connection] = None
 position_manager_instance: Optional[PositionManager] = None
 stop_event_main = threading.Event() # Подія для сигналізації про зупинку всім компонентам
 
 # Словник для зберігання пар з каналу 1, для яких очікуємо деталі
-# Ключ: нормалізована пара (напр., "INJUSDT"), Значення: Словник з даними ордеру
 pending_channel1_details = {}
+# Словник для зберігання пар з каналу 5, для яких очікуємо деталі
+pending_channel5_details = {} # <-- Додано для каналу 5
 
 # --- Обробник сигналів ОС (Ctrl+C) --- 
 def signal_handler(sig, frame):
@@ -57,7 +58,15 @@ def setup_logging(log_file="bot.log"):
     # Обробник для запису у файл (рівень INFO або DEBUG з конфігу?)
     # Поки що залишаємо INFO
     try:
-        logHandlerFile = logging.FileHandler(log_file, encoding='utf-8', mode='a') # Режим 'a' для дозапису
+        # --- Використовуємо ротацію логів --- 
+        logHandlerFile = logging.handlers.TimedRotatingFileHandler(
+            filename=log_file, 
+            when='midnight', # Ротація опівночі
+            interval=1,      # Кожен 1 день
+            backupCount=7,   # Зберігати 7 старих файлів
+            encoding='utf-8'
+        )
+        # --- Кінець ротації логів --- 
         logHandlerFile.setLevel(logging.DEBUG) # <-- Залишаємо DEBUG
         # Використовуємо стандартний форматер для файлу, json може бути незручним для читання
         formatterFile = logging.Formatter('%(asctime)s - %(levelname)-8s - %(name)-25s - %(message)s')
@@ -99,71 +108,51 @@ def load_config(config_path='config.json'):
         return None
 
 # --- Перевірка лімітів слотів ---
-# Змінюємо сигнатуру: db_conn більше не потрібен, функція створить тимчасове з'єднання
-def check_slot_availability(channel_key: str, config: dict) -> bool:
+def check_slot_availability(config: dict) -> bool:
     """Перевіряє, чи є вільний слот для відкриття позиції.
-       Створює ТИМЧАСОВЕ з'єднання з БД.
+       Використовує загальний ліміт для всіх каналів.
     """
     logger = logging.getLogger(__name__)
     limits = config.get('position_limits', {})
+    limit = limits.get('total_max_open') # <-- Використовуємо новий загальний ліміт
     active_count = -1
-    limit = -1
-    group_name = ""
     conn: Optional[sqlite3.Connection] = None
     available = False # За замовчуванням - не доступно
 
+    if limit is None:
+        logger.warning(f"[Slot Check] Не знайдено загальний ліміт 'total_max_open' в конфігу. Дозволено відкриття.")
+        return True # Дозволяємо, якщо ліміт не задано
+
     try:
-        # === Створюємо тимчасове з'єднання ===
+        # Створюємо тимчасове з'єднання
         conn = data_manager.get_db_connection()
         if not conn:
             logger.error(f"[Slot Check] Не вдалося створити тимчасове з'єднання з БД для перевірки слотів.")
-            return False # Якщо немає з'єднання, вважаємо, що слоту немає
+            return False
 
-        # === Логіка перевірки слотів (використовуємо тимчасове з'єднання conn) ===
-        if channel_key in ['channel_1', 'channel_2', 'channel_4']:
-            group_name = 'group_1_2_4'
-            limit = limits.get('group_1_2_4_max_open')
-            if limit is None:
-                 logger.warning(f"[Slot Check] Не знайдено ліміт 'group_1_2_4_max_open' в конфігу. Дозволено відкриття.")
-                 available = True # Дозволяємо, якщо ліміт не задано
-            else:
-                active_count = data_manager.get_active_position_count(conn, 'group_1_2_4')
+        # Отримуємо загальну кількість активних позицій (для всіх каналів)
+        active_count = data_manager.get_total_active_position_count(conn)
 
-        elif channel_key == 'channel_3':
-            group_name = 'channel_3'
-            limit = config.get('channels', {}).get(channel_key, {}).get('max_open_positions')
-            if limit is None:
-                 logger.warning(f"[Slot Check] Не знайдено ліміт 'max_open_positions' для {channel_key}. Дозволено відкриття.")
-                 available = True
-            else:
-                active_count = data_manager.get_active_position_count(conn, 'channel_3')
-
+        if active_count == -1: # Помилка отримання даних з БД
+            logger.error(f"[Slot Check] Не вдалося отримати загальну кількість активних позицій. Блокуємо відкриття.")
+            available = False
         else:
-            logger.warning(f"[Slot Check] Перевірка слотів для невідомого channel_key: {channel_key}. Дозволено.")
-            available = True
-
-        # Якщо ліміт встановлено, перевіряємо кількість
-        if not available and limit is not None:
-            if active_count == -1: # Помилка отримання даних з БД
-                 logger.error(f"[Slot Check] Не вдалося отримати кількість активних позицій для групи '{group_name}'. Блокуємо відкриття.")
-                 available = False
+            logger.info(f"[Slot Check] Загальний ліміт: Активних = {active_count}, Ліміт = {limit}")
+            if active_count < limit:
+                logger.info(f"[Slot Check] Є вільний слот.")
+                available = True
             else:
-                 logger.info(f"[Slot Check] Група '{group_name}': Активних = {active_count}, Ліміт = {limit}")
-                 if active_count < limit:
-                     logger.info(f"[Slot Check] Є вільний слот для групи '{group_name}'.")
-                     available = True
-                 else:
-                     logger.warning(f"[Slot Check] Ліміт слотів ({limit}) для групи '{group_name}' вичерпано. Нова угода не відкривається.")
-                     available = False
+                logger.warning(f"[Slot Check] Загальний ліміт слотів ({limit}) вичерпано. Нова угода не відкривається.")
+                available = False
 
     except sqlite3.Error as db_err:
          logger.error(f"[Slot Check] Помилка БД під час перевірки слотів: {db_err}", exc_info=True)
-         available = False # Блокуємо у разі помилки БД
+         available = False
     except Exception as e:
          logger.error(f"[Slot Check] Неочікувана помилка під час перевірки слотів: {e}", exc_info=True)
          available = False
     finally:
-        # === Гарантовано закриваємо тимчасове з'єднання ===
+        # Гарантовано закриваємо тимчасове з'єднання
         if conn:
             conn.close()
             logger.debug("[Slot Check] Тимчасове з'єднання з БД закрито.")
@@ -199,43 +188,29 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
     logger.info(f"--- Обробка сигналу від: {source_name} ({channel_key}) ---")
     logger.debug(f"\"\"\"Текст сигналу:\n{signal_text}\n---------------------\"\"\"")
 
-    # --- Перевірка слотів ПЕРЕД парсингом (викликаємо оновлену функцію БЕЗ db_conn) ---
-    if not check_slot_availability(channel_key, config):
-        return
+    # --- Перевірка слотів ПЕРЕД парсингом (для всіх каналів) ---
+    if not check_slot_availability(config):
+         return # Вихід, якщо немає вільних слотів
 
-    # --- Отримання спільних параметрів з конфігу --- 
-    try:
-        leverage = int(channel_config['leverage'])
-        entry_percentage = float(channel_config['entry_percentage'])
-        tp_distribution = channel_config.get('tp_distribution', [])
-        total_bankroll = float(config.get('global_settings', {}).get('total_bankroll', 0))
-        
-        if total_bankroll <= 0:
-             logger.error(f"[MessageHandler] total_bankroll ({total_bankroll}) має бути позитивним числом.")
-             return
-             
-    except (KeyError, ValueError, TypeError) as config_err:
-        logger.error(f"[MessageHandler] Помилка отримання/конвертації параметрів для {source_name}: {config_err}")
-        return
-        
-    margin_usdt = total_bankroll * (entry_percentage / 100.0)
-    logger.info(f"[MessageHandler] Параметри для {source_name}: Плече={leverage}x, Маржа={margin_usdt:.2f} USDT ({entry_percentage}% від {total_bankroll})")
-
-    # --- Обробка для Каналу 1 (дворівневий сигнал) ---
+    # --- Обробка для Каналу 1 (Даніель - двохетапний) ---
     if channel_key == "channel_1":
+        # --- Визначення параметрів для каналу 1 ---
+        leverage = channel_config.get('leverage', 10)
+        entry_percentage = channel_config.get('entry_percentage', 5.0)
+        margin_usdt = config.get('global_settings', {}).get('total_bankroll', 100) * (entry_percentage / 100.0)
+        tp_distribution = channel_config.get('tp_distribution', [])
+        # -----------------------------------------
+        
         # Спочатку пробуємо парсити як вхідний сигнал ("Заполняю...")
-        # Передаємо config
-        entry_data = signal_interpreter.parse_channel_1_entry(signal_text, config)
+        entry_data = signal_interpreter.parse_channel_1_entry(signal_text)
         if entry_data:
             pair_raw = entry_data['pair'] # Напр. "INJUSDT"
             direction = entry_data['direction']
-            position_side = direction.upper() # LONG або SHORT
-            order_side = 'buy' if position_side == 'LONG' else 'sell'
             api_symbol = bingx_api_instance._format_symbol_for_swap(pair_raw)
-            pending_key = pair_raw # Використовуємо оригінальну пару як ключ
-
-            logger.info(f"[Main C1 Entry] Отримано сигнал ВХОДУ для {pending_key} ({api_symbol}) {position_side}. Ініціюємо вхід по ринку...")
-
+            position_side = direction.upper()
+            order_side = 'buy' if position_side == 'LONG' else 'sell'
+            
+            logger.info(f"[Main C1 Entry] Отримано вхідний сигнал для {pair_raw} ({api_symbol}) {position_side}. Ініціюємо вхід по ринку...")
             market_order_result = bingx_api_instance.place_market_order_basic(
                 symbol=api_symbol,
                 side=order_side,
@@ -243,53 +218,43 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
                 margin_usdt=margin_usdt,
                 leverage=leverage
             )
-
-            if market_order_result and isinstance(market_order_result, dict) and market_order_result.get('id'):
-                order_status = market_order_result.get('status', 'unknown')
+            if market_order_result and market_order_result.get('id') and market_order_result.get('filled') > 0:
                 filled_amount = market_order_result.get('filled')
                 market_symbol = market_order_result.get('symbol')
-                order_id = market_order_result.get('id')
-                avg_price = market_order_result.get('average', market_order_result.get('price'))
-                cost = market_order_result.get('cost')
-
-                if order_status == 'closed' and filled_amount is not None and filled_amount > 0 and avg_price is not None:
-                    logger.info(f"[Main C1 Entry] Ринковий ордер {order_id} для {pending_key} ({market_symbol}) {position_side} УСПІШНО ВИКОНАНО. Обсяг: {filled_amount}, Ціна: {avg_price:.5f}, Вартість: {cost:.2f} USDT")
-                    pending_channel1_details[pending_key] = {
-                        'symbol': market_symbol,
+                logger.info(f"[Main C1 Entry] Ринковий ордер виконано. Обсяг: {filled_amount}. Очікуємо деталі сигналу для {market_symbol}...")
+                # Зберігаємо дані виконаного ордера для подальшого використання
+                pending_channel1_details[market_symbol] = {
                         'position_side': position_side,
-                        'entry_price': avg_price,
-                        'initial_amount': filled_amount,
-                        'leverage': leverage,
-                        'initial_margin': margin_usdt,
-                        'market_order_id': order_id,
-                        'timestamp': time.time()
-                    }
-                    logger.info(f"[Main C1 Entry] Позиція {pending_key} додана до очікування деталей TP/SL.")
-                else:
-                    logger.error(f"[Main C1 Entry] Ринковий ордер {order_id} для {pending_key} ({market_symbol}) не виконався коректно або статус не 'closed'. Статус: {order_status}, Виконано: {filled_amount}, Ціна: {avg_price}. Ордер: {market_order_result}")
+                    'initial_amount': filled_amount,
+                    'margin_usdt': margin_usdt,
+                    'leverage': leverage,
+                    'entry_price': market_order_result.get('average', market_order_result.get('price')),
+                    'market_order_id': market_order_result.get('id'),
+                    'timestamp': time.time() # Додаємо час для можливого очищення старих
+                }
             else:
-                 logger.error(f"[Main C1 Entry] Не вдалося розмістити ринковий ордер для {pending_key} ({api_symbol}) або відповідь API некоректна. Відповідь: {market_order_result}")
-        # Якщо це не entry_data, можливо це details_data
-        else:
-            # Передаємо config
+                 logger.error(f"[Main C1 Entry] Не вдалося виконати ринковий ордер для {api_symbol}. Відповідь: {market_order_result}")
+
+        else: # Якщо це не entry сигнал, пробуємо парсити як details
             details_data = signal_interpreter.parse_channel_1_details(signal_text, config)
             if details_data:
                 pair_raw = details_data['pair']
-                pending_key = pair_raw
-                logger.info(f"[Main C1 Details] Отримано деталі TP/SL для {pending_key}.")
-
-                if pending_key in pending_channel1_details:
-                    entry_info = pending_channel1_details[pending_key]
-                    market_symbol = entry_info['symbol']
+                api_symbol_details = bingx_api_instance._format_symbol_for_swap(pair_raw)
+                # Шукаємо відповідний запис в pending
+                if api_symbol_details in pending_channel1_details:
+                    logger.info(f"[Main C1 Details] Знайдено деталі для {api_symbol_details}. Встановлюємо SL/TP...")
+                    entry_info = pending_channel1_details.pop(api_symbol_details) # Видаляємо після використання
+                    
+                    # Параметри з попереднього етапу
+                    market_symbol = api_symbol_details # Мають співпадати
                     position_side = entry_info['position_side']
-                    entry_price = entry_info['entry_price']
                     initial_amount = entry_info['initial_amount']
-                    leverage = entry_info['leverage']
-                    initial_margin = entry_info['initial_margin']
-                    # market_order_id = entry_info['market_order_id'] # Не використовується прямо, але є
+                    entry_price = entry_info['entry_price']
+                    # leverage, margin_usdt з entry_info для точності, якщо потрібно
 
-                    sl_price = details_data.get('sl')
-                    tp_prices = details_data.get('tp', [])
+                    # Дані з поточного повідомлення (details)
+                    sl_price = details_data.get('stop_loss') 
+                    tp_prices = details_data.get('take_profits', [])
 
                     # Розміщення SL
                     sl_order = None
@@ -304,35 +269,26 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
                             logger.error(f"[Main C1 Details] Не вдалося розмістити SL ордер для {market_symbol}. SL Ціна: {sl_price}. Відповідь: {sl_order}")
                             sl_order = None # Reset to None if failed
 
-                    # Розміщення TP
+                    # Оновлено розміщення TP за допомогою set_take_profits
                     tp_orders = []
-                    if tp_prices and initial_amount > 0 and tp_distribution and len(tp_distribution) == len(tp_prices):
-                        remaining_amount_tp = initial_amount
-                        for i, tp_price in enumerate(tp_prices):
-                            tp_percentage = tp_distribution[i]
-                            tp_amount = initial_amount * (tp_percentage / 100.0)
-                            # Останній TP забирає весь залишок
-                            if i == len(tp_prices) - 1:
-                                tp_amount = remaining_amount_tp
-
-                            if tp_amount > 1e-9: # Розміщуємо тільки якщо обсяг > 0
-                                tp_order = bingx_api_instance.place_tp_order(
-                                    symbol=market_symbol,
-                                    position_side=position_side,
-                                    tp_price=tp_price,
-                                    amount=tp_amount
-                                )
-                                if tp_order and tp_order.get('id'):
-                                    tp_orders.append(tp_order)
-                                    remaining_amount_tp -= tp_amount
-                                else:
-                                    logger.error(f"[Main C1 Details] Не вдалося розмістити TP{i+1} ордер для {market_symbol}. TP Ціна: {tp_price}, Обсяг: {tp_amount}. Відповідь: {tp_order}")
-                                    tp_orders = [] # Reset TP orders if any failed
-                                    break
-                            else:
-                                logger.warning(f"[Main C1 Details] Пропуск розміщення TP{i+1} для {market_symbol} через нульовий або від'ємний розрахований обсяг: {tp_amount}")
-
-                    # ЗАПИС В БАЗУ ДАНИХ (тільки якщо SL і всі TP створені)
+                    if tp_prices and initial_amount > 0 and tp_distribution:
+                        logger.info(f"[Main C1 Details] Спроба встановити {len(tp_prices)} TP ордер(ів) для {market_symbol}...")
+                        tp_orders = bingx_api_instance.set_take_profits(
+                            symbol=market_symbol,
+                            position_side=position_side,
+                            take_profit_prices=tp_prices,
+                            tp_distribution=tp_distribution,
+                            initial_amount=initial_amount
+                        )
+                        if not tp_orders or len(tp_orders) != len(tp_prices):
+                            logger.error(f"[Main C1 Details] Не вдалося створити повний набір ({len(tp_orders)}/{len(tp_prices)}) TP ордерів для {market_symbol}. TP Ціни: {tp_prices}. Відповідь: {tp_orders}")
+                            tp_orders = [] # Reset TP orders if any failed
+                        else:
+                            logger.info(f"[Main C1 Details] Успішно створено {len(tp_orders)} TP ордер(ів) для {market_symbol}.")
+                    elif tp_prices:
+                        logger.warning(f"[Main C1 Details] TP ціни ({tp_prices}) є, але або обсяг ({initial_amount}) нульовий, або tp_distribution ({tp_distribution}) порожній. TP не встановлюються.")
+                    
+                    # ЗАПИС В БАЗУ ДАНИХ
                     if sl_order and tp_orders and len(tp_orders) == len(tp_prices):
                         conn_add: Optional[sqlite3.Connection] = None
                         try:
@@ -351,8 +307,8 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
                                     'entry_price': entry_price,
                                     'initial_amount': initial_amount,
                                     'current_amount': initial_amount,
-                                    'initial_margin': initial_margin,
-                                    'leverage': leverage,
+                                    'initial_margin': entry_info['margin_usdt'],
+                                    'leverage': entry_info['leverage'],
                                     'sl_order_id': sl_order['id'],
                                     'tp_order_ids': [tp['id'] for tp in tp_orders],
                                     'related_limit_order_id': None,
@@ -362,8 +318,9 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
                                 new_pos_id = data_manager.add_new_position(conn_add, position_data_to_db)
                                 if new_pos_id:
                                     logger.info(f"[Main C1 Details] Позиція {market_symbol} ({position_side}) успішно збережена в БД з ID {new_pos_id}.")
-                                    if pending_key in pending_channel1_details:
-                                        del pending_channel1_details[pending_key]
+                                    # Перевіряємо ще раз і видаляємо, якщо ключ досі існує
+                                    if api_symbol_details in pending_channel1_details:
+                                        del pending_channel1_details[api_symbol_details]
                                 else:
                                     logger.error(f"[Main C1 Details] Не вдалося зберегти позицію {market_symbol} в БД!")
                                     # Скасування створених ордерів
@@ -371,37 +328,39 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
                                     if cancel_ids:
                                         bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
                         except sqlite3.Error as db_err:
-                             logger.error(f"[Main C1 Details] Помилка БД при збереженні позиції {market_symbol}: {db_err}", exc_info=True)
-                             # Скасування створених ордерів
-                             cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
-                             if cancel_ids:
-                                 bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
+                            logger.error(f"[Main C1 Details] Помилка БД при збереженні позиції {market_symbol}: {db_err}", exc_info=True)
+                            # Скасування створених ордерів
+                            cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
+                            if cancel_ids:
+                                bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
                         finally:
-                             if conn_add:
-                                 conn_add.close()
-                    else: # Якщо SL або TP не створено
-                         logger.error(f"[Main C1 Details] Не вдалося створити повний набір SL/TP ордерів для {market_symbol}. SL створено: {bool(sl_order)}, TP створено: {len(tp_orders)}/{len(tp_prices)}. Збереження в БД скасовано.")
-                         # Скасування вже створених ордерів
-                         cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
-                         if cancel_ids:
-                              logger.warning(f"[Main C1 Details] Скасування частково створених ордерів: {cancel_ids}")
-                              bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
-                else: # Якщо pending_key не в pending_channel1_details
-                    logger.warning(f"[Main C1 Details] Отримано деталі для {pending_key}, але відповідного запису про вхід не знайдено в очікуванні.")
-            # Якщо це не details_data
-            else:
-                 logger.warning(f"[Main C1] Не вдалося розпарсити повідомлення як сигнал входу або деталей для каналу 1.")
-
-    # --- Обробка для Каналу 2 (один сигнал з усім) ---
+                            if conn_add:
+                                conn_add.close()
+                    else:
+                        logger.error(f"[Main C1 Details] Не вдалося створити повний набір SL/TP ордерів для {market_symbol}. SL: {bool(sl_order)}, TP: {len(tp_orders)}/{len(tp_prices)}. Збереження в БД скасовано.")
+                        # Скасування SL, якщо він був створений
+                        if sl_order and sl_order.get('id'):
+                            logger.warning(f"[Main C1 Details] Скасування частково створеного SL ордера: {sl_order['id']}")
+                            bingx_api_instance.cancel_order(market_symbol, sl_order['id'])
+                else:
+                    logger.warning(f"[Main C1 Details] Отримано деталі для {api_symbol_details}, але немає відповідного запису в pending_channel1_details.")
+            # else: # Якщо це не entry і не details сигнал
+            #     logger.debug(f"[Main C1] Повідомлення не розпізнано як 'entry' або 'details' для каналу 1.")
+        # --- Обробка для Каналу 2 (Мартин - повний сигнал) ---
     elif channel_key == "channel_2":
-        # Передаємо config
+        # --- Визначення параметрів для каналу 2 ---
+        leverage = channel_config.get('leverage', 10)
+        entry_percentage = channel_config.get('entry_percentage', 5.0)
+        margin_usdt = config.get('global_settings', {}).get('total_bankroll', 100) * (entry_percentage / 100.0)
+        tp_distribution = channel_config.get('tp_distribution', [])
+        # -----------------------------------------
         signal_data = signal_interpreter.parse_channel_2(signal_text, config)
         if signal_data:
             pair_raw = signal_data['pair']
             direction = signal_data['direction']
-            entry_price_signal = signal_data.get('entry') # Може бути відсутнє
-            sl_price = signal_data.get('sl')
-            tp_prices = signal_data.get('tp', [])
+            entry_price_signal = signal_data.get('entry_price') # Використовуємо правильний ключ від парсера C2
+            sl_price = signal_data.get('stop_loss') # <-- Виправлено ключ
+            tp_prices = signal_data.get('take_profits', []) # <-- Виправлено ключ
             api_symbol = bingx_api_instance._format_symbol_for_swap(pair_raw)
             position_side = direction.upper()
             order_side = 'buy' if position_side == 'LONG' else 'sell'
@@ -411,11 +370,11 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
             # РОБОТА З БІРЖЕЮ (Розміщення ордерів)
             market_order_result = bingx_api_instance.place_market_order_basic(
                 symbol=api_symbol,
-                side=order_side,
-                position_side=position_side,
+                    side=order_side,
+                    position_side=position_side,
                 margin_usdt=margin_usdt,
-                leverage=leverage
-            )
+                    leverage=leverage
+                )
 
             if market_order_result and isinstance(market_order_result, dict) and market_order_result.get('id'):
                  order_status = market_order_result.get('status', 'unknown')
@@ -438,28 +397,22 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
 
                     # Розміщення TP
                     tp_orders = []
-                    if tp_prices and filled_amount > 0 and tp_distribution and len(tp_distribution) == len(tp_prices):
-                        remaining_amount_tp = filled_amount
-                        for i, tp_price in enumerate(tp_prices):
-                            tp_percentage = tp_distribution[i]
-                            tp_amount = filled_amount * (tp_percentage / 100.0)
-                            if i == len(tp_prices) - 1:
-                                tp_amount = remaining_amount_tp
+                    if tp_prices and filled_amount > 0 and tp_distribution:
+                        logger.info(f"[Main C2] Спроба встановити {len(tp_prices)} TP ордер(ів) для {market_symbol}...")
+                        tp_orders = bingx_api_instance.set_take_profits(
+                            symbol=market_symbol,
+                            position_side=position_side,
+                            initial_amount=filled_amount, # Виправлено порядок
+                            take_profit_prices=tp_prices,
+                            tp_distribution=tp_distribution
+                        )
+                        if not tp_orders or len(tp_orders) != len(tp_prices):
+                             logger.error(f"[Main C2] Не вдалося створити повний набір ({len(tp_orders)}/{len(tp_prices)}) TP ордерів для {market_symbol}. TP Ціни: {tp_prices}. Відповідь: {tp_orders}")
+                             tp_orders = []
+                    else:
+                        logger.warning(f"[Main C2] TP ціни ({tp_prices}) є, але або обсяг ({filled_amount}) нульовий, або tp_distribution ({tp_distribution}) порожній. TP не встановлюються.")
 
-                            if tp_amount > 1e-9:
-                                tp_order = bingx_api_instance.place_tp_order(market_symbol, position_side, tp_price, tp_amount)
-                                if tp_order and tp_order.get('id'):
-                                    tp_orders.append(tp_order)
-                                    remaining_amount_tp -= tp_amount
-                                else:
-                                    logger.error(f"[Main C2] Не вдалося розмістити TP{i+1} ордер для {market_symbol}. TP Ціна: {tp_price}, Обсяг: {tp_amount}. Відповідь: {tp_order}")
-                                    tp_orders = []
-                                    break
-                            else:
-                                logger.warning(f"[Main C2] Пропуск розміщення TP{i+1} для {market_symbol} через нульовий обсяг: {tp_amount}")
-
-
-                    # ЗАПИС В БАЗУ ДАНИХ (тільки якщо SL і всі TP створені)
+                    # ЗАПИС В БАЗУ ДАНИХ (тільки якщо SL і *всі* TP створені)
                     if sl_order and tp_orders and len(tp_orders) == len(tp_prices):
                         conn_add_c2: Optional[sqlite3.Connection] = None
                         try:
@@ -489,15 +442,12 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
                                 if new_pos_id:
                                      logger.info(f"[Main C2] Позиція {market_symbol} ({position_side}) успішно збережена в БД з ID {new_pos_id}.")
                                 else:
-                                     logger.error(f"[Main C2] Не вдалося зберегти позицію {market_symbol} в БД!")
-                                     # Скасування ордерів
-                                     cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
-                                     if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
-                        except sqlite3.Error as db_err:
-                            logger.error(f"[Main C2] Помилка БД при збереженні позиції {market_symbol}: {db_err}", exc_info=True)
-                            # Скасування ордерів
-                            cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
-                            if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
+                                    raise Exception("Failed to add position to DB")
+                        except Exception as db_err_c2:
+                             logger.error(f"[Main C2] Помилка БД при збереженні позиції {market_symbol}: {db_err_c2}", exc_info=True)
+                             # Скасування ордерів, якщо не вдалося записати в БД
+                             cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
+                             if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
                         finally:
                             if conn_add_c2:
                                 conn_add_c2.close()
@@ -505,157 +455,46 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
                          logger.error(f"[Main C2] Не вдалося створити повний набір SL/TP ордерів для {market_symbol}. SL створено: {bool(sl_order)}, TP створено: {len(tp_orders)}/{len(tp_prices)}. Збереження в БД скасовано.")
                          # Скасування ордерів
                          cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
-                         if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
+                         if cancel_ids:
+                              logger.warning(f"[Main C2] Скасування частково створених ордерів: {cancel_ids}")
+                              bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
                  else: # Якщо ринковий ордер не виконався
                      logger.error(f"[Main C2] Ринковий ордер {order_id} для {market_symbol} не виконався коректно. Статус: {order_status}, Виконано: {filled_amount}. Ордер: {market_order_result}")
             else: # Якщо ринковий ордер не вдалося розмістити
                  logger.error(f"[Main C2] Не вдалося розмістити ринковий ордер для {api_symbol}. Відповідь: {market_order_result}")
-        # Якщо signal_data не отримано
-        else:
+        else: # Якщо signal_data не отримано
             logger.warning(f"[Main C2] Не вдалося розпарсити сигнал для каналу 2.")
 
-    # --- Обробка для Каналу 3 (лімітний вхід) ---
-    elif channel_key == "channel_3":
-        # Передаємо config
-        signal_data = signal_interpreter.parse_channel_3_entry(signal_text, config)
-        if signal_data:
-            pair_raw = signal_data['pair']
-            direction = signal_data['direction']
-            entry_price = signal_data.get('entry') # Обов'язкове для ліміту
-            sl_price = signal_data.get('sl')
-            tp_prices = signal_data.get('tp', [])
-            api_symbol = bingx_api_instance._format_symbol_for_swap(pair_raw)
-            position_side = direction.upper()
-            order_side = 'buy' if position_side == 'LONG' else 'sell'
-
-            if entry_price is None:
-                logger.error("[Main C3] Не знайдено ціну входу (entry) в сигналі, яка є обов'язковою для лімітного ордера.")
-                return # Виходимо з handle_new_message
-
-            logger.info(f"[Main C3] Отримано сигнал для {pair_raw} ({api_symbol}) {position_side}. Лімітний вхід={entry_price}, SL={sl_price}, TP={tp_prices}.")
-
-            # РОБОТА З БІРЖЕЮ
-            limit_order = None
-            sl_order = None
-            tp_orders = []
-
-            # Розрахунок обсягу для лімітного ордера
-            limit_amount = bingx_api_instance.calculate_order_size(margin_usdt, leverage, entry_price)
-            if limit_amount is None or limit_amount <= 0:
-                logger.error(f"[Main C3] Не вдалося розрахувати обсяг для лімітного ордера {api_symbol} або він <= 0. Маржа: {margin_usdt}, Плече: {leverage}, Ціна: {entry_price}")
-                return # Виходимо з handle_new_message
-
-            # Розміщення лімітного ордера
-            limit_order = bingx_api_instance.place_limit_order(api_symbol, order_side, position_side, entry_price, limit_amount)
-            if not limit_order or not limit_order.get('id'):
-                logger.error(f"[Main C3] Не вдалося розмістити лімітний ордер для {api_symbol}. Ціна: {entry_price}, Обсяг: {limit_amount}. Відповідь: {limit_order}")
-                return # Зупиняємось, якщо лімітка не створена
-
-            logger.info(f"[Main C3] Лімітний ордер {limit_order['id']} для {api_symbol} успішно розміщено.")
-
-            # Розміщення SL (з таким же обсягом, як лімітка)
-            if sl_price is not None:
-                sl_order = bingx_api_instance.set_stop_loss(api_symbol, position_side, sl_price, limit_amount)
-                if not sl_order or not sl_order.get('id'):
-                     logger.error(f"[Main C3] Не вдалося розмістити SL ордер для {api_symbol}. SL Ціна: {sl_price}. Відповідь: {sl_order}")
-                     sl_order = None # Reset
-
-            # Розміщення TP (з обсягами, що відповідають розподілу від лімітного обсягу)
-            if tp_prices and limit_amount > 0 and tp_distribution and len(tp_distribution) == len(tp_prices):
-                remaining_amount_tp = limit_amount
-                for i, tp_price in enumerate(tp_prices):
-                    tp_percentage = tp_distribution[i]
-                    tp_amount = limit_amount * (tp_percentage / 100.0)
-                    if i == len(tp_prices) - 1:
-                        tp_amount = remaining_amount_tp
-
-                    if tp_amount > 1e-9:
-                        tp_order = bingx_api_instance.place_tp_order(api_symbol, position_side, tp_price, tp_amount)
-                        if tp_order and tp_order.get('id'):
-                             tp_orders.append(tp_order)
-                             remaining_amount_tp -= tp_amount
-                        else:
-                             logger.error(f"[Main C3] Не вдалося розмістити TP{i+1} ордер для {api_symbol}. TP Ціна: {tp_price}, Обсяг: {tp_amount}. Відповідь: {tp_order}")
-                             tp_orders = [] # Reset
-                             break
-                    else:
-                        logger.warning(f"[Main C3] Пропуск розміщення TP{i+1} для {api_symbol} через нульовий обсяг: {tp_amount}")
-
-            # ЗАПИС В БАЗУ ДАНИХ (тільки якщо ЛІМІТ, SL і всі TP створені)
-            if limit_order and sl_order and tp_orders and len(tp_orders) == len(tp_prices):
-                conn_add_c3: Optional[sqlite3.Connection] = None
-                try:
-                    conn_add_c3 = data_manager.get_db_connection()
-                    if not conn_add_c3:
-                        logger.critical(f"[Main C3] Не вдалося створити з'єднання з БД для збереження позиції {api_symbol}!")
-                        # Скасування всіх ордерів
-                        cancel_ids = [o['id'] for o in [limit_order, sl_order] + tp_orders if o and o.get('id')]
-                        if cancel_ids: bingx_api_instance.cancel_multiple_orders(api_symbol, cancel_ids)
-                    else:
-                        position_data_to_db = {
-                            'signal_channel_key': channel_key,
-                            'symbol': api_symbol,
-                            'position_side': position_side,
-                            'entry_price': entry_price, # Ціна лімітного ордера
-                            'initial_amount': limit_amount, # Обсяг лімітного ордера
-                            'current_amount': limit_amount, # Поки що поточний = початковому
-                            'initial_margin': margin_usdt,
-                            'leverage': leverage,
-                            'sl_order_id': sl_order['id'],
-                            'tp_order_ids': [tp['id'] for tp in tp_orders],
-                            'related_limit_order_id': limit_order['id'], # Зберігаємо ID лімітки
-                            'is_breakeven': 0,
-                            'is_active': 1 # Позиція вважається активною, поки лімітка не виконана/скасована
-                        }
-                        new_pos_id = data_manager.add_new_position(conn_add_c3, position_data_to_db)
-                        if new_pos_id:
-                            logger.info(f"[Main C3] Позиція {api_symbol} ({position_side}) успішно збережена в БД з ID {new_pos_id} (очікує виконання лімітного ордера {limit_order['id']}).")
-                        else: # Якщо не вдалося додати в БД
-                            logger.error(f"[Main C3] Не вдалося зберегти позицію {api_symbol} в БД!")
-                            # Скасування всіх ордерів
-                            cancel_ids = [o['id'] for o in [limit_order, sl_order] + tp_orders if o and o.get('id')]
-                            if cancel_ids: bingx_api_instance.cancel_multiple_orders(api_symbol, cancel_ids)
-                except sqlite3.Error as db_err:
-                    logger.error(f"[Main C3] Помилка БД при збереженні позиції {api_symbol}: {db_err}", exc_info=True)
-                    # Скасування всіх ордерів
-                    cancel_ids = [o['id'] for o in [limit_order, sl_order] + tp_orders if o and o.get('id')]
-                    if cancel_ids: bingx_api_instance.cancel_multiple_orders(api_symbol, cancel_ids)
-                finally:
-                    if conn_add_c3:
-                        conn_add_c3.close()
-            else: # Якщо не створено повний набір ордерів
-                 logger.error(f"[Main C3] Не вдалося створити повний набір ордерів (Limit, SL, TP) для {api_symbol}. Limit: {bool(limit_order)}, SL: {bool(sl_order)}, TP: {len(tp_orders)}/{len(tp_prices)}. Збереження в БД скасовано.")
-                 # Скасування вже створених ордерів
-                 cancel_ids = [o['id'] for o in [limit_order, sl_order] + tp_orders if o and o.get('id')]
-                 if cancel_ids:
-                      logger.warning(f"[Main C3] Скасування частково створених ордерів: {cancel_ids}")
-                      bingx_api_instance.cancel_multiple_orders(api_symbol, cancel_ids)
-        # Якщо signal_data не отримано
-        else:
-            logger.warning(f"[Main C3] Не вдалося розпарсити сигнал для каналу 3.")
-
-    # --- Обробка для Каналу 4 (простий ринковий) ---
+    # --- Обробка для Каналу 4 (Костя - повний сигнал) ---
     elif channel_key == "channel_4":
-        # Передаємо config
-        signal_data = signal_interpreter.parse_channel_4(signal_text, config)
+        # --- Визначення параметрів для каналу 4 ---
+        leverage = channel_config.get('leverage', 10)
+        entry_percentage = channel_config.get('entry_percentage', 5.0)
+        margin_usdt = config.get('global_settings', {}).get('total_bankroll', 100) * (entry_percentage / 100.0)
+        tp_distribution = channel_config.get('tp_distribution', [])
+        # -----------------------------------------
+        
+        # Парсимо сигнал як єдине ціле
+        signal_data = signal_interpreter.parse_channel_4(signal_text, config) 
         if signal_data:
             pair_raw = signal_data['pair']
             direction = signal_data['direction']
             sl_price = signal_data.get('stop_loss')
+            tp_prices = signal_data.get('take_profits', []) # Беремо TP з результату парсингу
             api_symbol = bingx_api_instance._format_symbol_for_swap(pair_raw)
             position_side = direction.upper()
             order_side = 'buy' if position_side == 'LONG' else 'sell'
 
-            logger.info(f"[Main C4] Отримано сигнал для {pair_raw} ({api_symbol}) {position_side}. SL={sl_price}. Ініціюємо вхід по ринку...")
+            logger.info(f"[Main C4] Отримано сигнал для {pair_raw} ({api_symbol}) {position_side}. SL={sl_price}, TP={tp_prices}. Ініціюємо вхід по ринку...")
 
             # РОБОТА З БІРЖЕЮ
             market_order_result = bingx_api_instance.place_market_order_basic(
                 symbol=api_symbol,
-                side=order_side,
-                position_side=position_side,
+                    side=order_side,
+                    position_side=position_side,
                 margin_usdt=margin_usdt,
-                leverage=leverage
-            )
+                    leverage=leverage
+                )
 
             if market_order_result and isinstance(market_order_result, dict) and market_order_result.get('id'):
                  order_status = market_order_result.get('status', 'unknown')
@@ -670,102 +509,195 @@ def handle_new_message(forwarded_channel_title: str, signal_text: str, config: d
 
                     # Розміщення SL
                     sl_order = None
-                    tp_orders = [] # Додано ініціалізацію
-
-                    # Розміщення SL
                     if sl_price is not None:
                         sl_order = bingx_api_instance.set_stop_loss(market_symbol, position_side, sl_price, filled_amount)
                         if not sl_order or not sl_order.get('id'):
                              logger.error(f"[Main C4] Не вдалося розмістити SL ордер для {market_symbol}. SL Ціна: {sl_price}. Відповідь: {sl_order}")
                              sl_order = None
 
-                    # --- Додано розміщення TP --- 
-                    tp_prices = signal_data.get('take_profits', [])
-                    # --- Додано детальне логування перед умовою TP ---
-                    logger.debug(f"[Main C4 Pre-TP Check] tp_prices={tp_prices} (type: {type(tp_prices)}), filled_amount={filled_amount} (type: {type(filled_amount)}), tp_distribution={tp_distribution} (type: {type(tp_distribution)})")
-                    logger.debug(f"[Main C4 Pre-TP Check] Умови: bool(tp_prices)={bool(tp_prices)}, filled_amount > 0={filled_amount > 0}, bool(tp_distribution)={bool(tp_distribution)}")
-                    # --- Кінець доданого логування ---
+                    # Розміщення TP 
+                    tp_orders = []
                     if tp_prices and filled_amount > 0 and tp_distribution:
                         logger.info(f"[Main C4] Спроба встановити {len(tp_prices)} TP ордер(ів) для {market_symbol}...")
                         tp_orders = bingx_api_instance.set_take_profits(
-                            symbol=market_symbol, 
-                            position_side=position_side, 
+                            symbol=market_symbol,
+                            position_side=position_side,
+                            initial_amount=filled_amount,
                             take_profit_prices=tp_prices,
-                            tp_distribution=tp_distribution, 
-                            initial_amount=filled_amount
+                            tp_distribution=tp_distribution 
                         )
                         if not tp_orders or len(tp_orders) != len(tp_prices):
-                             logger.error(f"[Main C4] Не вдалося створити повний набір ({len(tp_orders)}/{len(tp_prices)}) TP ордерів для {market_symbol}. TP Ціни: {tp_prices}. Відповідь: {tp_orders}")
-                             # Якщо ТП не створено, вважаємо це помилкою
-                             # sl_order = None # Не скасовуємо SL, бо позиція вже відкрита. Лише логуємо
-                             tp_orders = [] # Скидаємо список ТП
+                             logger.error(f"[Main C4] Не вдалося створити всі TP...")
+                             tp_orders = [] 
                         else:
                              logger.info(f"[Main C4] Успішно створено {len(tp_orders)} TP ордер(ів) для {market_symbol}.")
                     elif tp_prices:
-                         logger.warning(f"[Main C4] TP ціни ({tp_prices}) є, але або обсяг ({filled_amount}) нульовий, або tp_distribution ({tp_distribution}) порожній. TP не встановлюються.")
-                    # --- Кінець доданого коду TP ---
+                         logger.warning(f"[Main C4] TP ціни є, але або обсяг ({filled_amount}) нульовий, або tp_distribution ({tp_distribution}) порожній. TP не встановлюються.")
                     
-                    # ЗАПИС В БАЗУ ДАНИХ (тільки якщо SL створено, TP опціонально) 
-                    # Логіка для каналу 4: записуємо, якщо є хоча б SL. 
-                    # Якщо ТП були в сигналі, але не створені, буде попередження вище.
-                    if sl_order: 
+                    # ЗАПИС В БАЗУ ДАНИХ (якщо SL і всі TP створені)
+                    if sl_order and tp_orders and len(tp_orders) == len(tp_prices):
                         conn_add_c4: Optional[sqlite3.Connection] = None
                         try:
                              conn_add_c4 = data_manager.get_db_connection()
-                             if not conn_add_c4:
-                                 logger.critical(f"[Main C4] Не вдалося створити з'єднання з БД для збереження позиції {market_symbol}!")
-                                 # Скасувати SL і TP?
-                                 cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
-                                 if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
+                             if not conn_add_c4: raise Exception("DB connection failed")
+                             position_data_to_db = {
+                                'signal_channel_key': channel_key,
+                                'symbol': market_symbol,
+                                'position_side': position_side,
+                                'entry_price': avg_price,
+                                'initial_amount': filled_amount,
+                                'current_amount': filled_amount,
+                                'initial_margin': margin_usdt,
+                                'leverage': leverage,
+                                'sl_order_id': sl_order['id'],
+                                'tp_order_ids': [tp['id'] for tp in tp_orders],
+                                'related_limit_order_id': None,
+                                'is_breakeven': 0,
+                                'is_active': 1
+                             }
+                             new_pos_id = data_manager.add_new_position(conn_add_c4, position_data_to_db)
+                             if new_pos_id:
+                                 logger.info(f"[Main C4] Позиція {market_symbol} ({position_side}) успішно збережена в БД з ID {new_pos_id}.")
                              else:
-                                position_data_to_db = {
-                                    'signal_channel_key': channel_key,
-                                    'symbol': market_symbol,
-                                    'position_side': position_side,
-                                    'entry_price': avg_price,
-                                    'initial_amount': filled_amount,
-                                    'current_amount': filled_amount,
-                                    'initial_margin': margin_usdt,
-                                    'leverage': leverage,
-                                    'sl_order_id': sl_order['id'],
-                                    'tp_order_ids': [tp['id'] for tp in tp_orders], # Використовуємо список tp_orders
-                                    'related_limit_order_id': None,
-                                    'is_breakeven': 0,
-                                    'is_active': 1
-                                }
-                                new_pos_id = data_manager.add_new_position(conn_add_c4, position_data_to_db)
-                                if new_pos_id:
-                                    logger.info(f"[Main C4] Позиція {market_symbol} ({position_side}) успішно збережена в БД з ID {new_pos_id}.")
-                                else: # Якщо не вдалося додати в БД
-                                    logger.error(f"[Main C4] Не вдалося зберегти позицію {market_symbol} в БД!")
-                                    # Скасувати SL і TP
-                                    cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
-                                    if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
-                        except sqlite3.Error as db_err:
-                            logger.error(f"[Main C4] Помилка БД при збереженні позиції {market_symbol}: {db_err}", exc_info=True)
-                            # Скасувати SL і TP
-                            cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
-                            if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
+                                 raise Exception("Failed to add position to DB")
+                        except Exception as db_err_c4:
+                             logger.error(f"[Main C4] Помилка БД при збереженні позиції {market_symbol}: {db_err_c4}", exc_info=True)
+                             # Скасування ордерів, якщо не вдалося записати в БД
+                             cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
+                             if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
                         finally:
-                            if conn_add_c4:
-                                conn_add_c4.close()
-                    # Якщо SL не вдалося створити
-                    elif sl_price is not None: # Тільки якщо SL був у сигналі, але не створився
-                         logger.error(f"[Main C4] Не вдалося створити SL ордер для {market_symbol}. Збереження в БД скасовано.")
-                         logger.critical(f"[Main C4] !!! ПОТРІБНО ВРУЧНУ ОБРОБИТИ ВІДКРИТУ ПОЗИЦІЮ {market_symbol} ({position_side}) БЕЗ SL !!!")
-                    # Якщо SL і не було в сигналі - це нормально для каналу 4? Якщо так, можна записати в БД
-                    # elif sl_price is None: 
-                    #     logger.info(f"[Main C4] SL не було в сигналі. Записуємо позицію без SL/TP...")
-                    #     # ... (додати логіку збереження без SL) ...
-
-                 # Якщо ринковий ордер не виконався
-                 else:
-                     logger.error(f"[Main C4] Ринковий ордер {order_id} для {market_symbol} не виконався коректно. Статус: {order_status}, Виконано: {filled_amount}. Ордер: {market_order_result}")
-            else: # Якщо ринковий ордер не вдалося розмістити
+                             if conn_add_c4: conn_add_c4.close()
+                    else: # Якщо SL або TP не створено
+                         logger.error(f"[Main C4] Не вдалося створити повний набір SL/TP... Збереження скасовано.")
+                         # Скасування частково створених ордерів
+                         cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
+                         if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
+                 else: # Якщо ринковий ордер не виконався коректно
+                     logger.error(f"[Main C4] Ринковий ордер {order_id} не виконався коректно. Статус: {order_status}...")
+            else: # Якщо не вдалося розмістити ринковий ордер
                  logger.error(f"[Main C4] Не вдалося розмістити ринковий ордер для {api_symbol}. Відповідь: {market_order_result}")
-        # Якщо signal_data не отримано
-        else:
+        else: # Якщо не вдалося розпарсити сигнал
              logger.warning(f"[Main C4] Не вдалося розпарсити сигнал для каналу 4.")
+
+    # --- Обробка для Каналу 5 (Валерій - двохетапний) ---
+    elif channel_key == "channel_5":
+        # --- Визначення параметрів для каналу 5 ---
+        leverage = channel_config.get('leverage', 10)
+        entry_percentage = channel_config.get('entry_percentage', 5.0)
+        margin_usdt = config.get('global_settings', {}).get('total_bankroll', 100) * (entry_percentage / 100.0)
+        tp_distribution = channel_config.get('tp_distribution', [])
+        # -----------------------------------------
+
+        # Спочатку пробуємо парсити як вхідний сигнал ("Захожу...")
+        entry_data = signal_interpreter.parse_channel_5_entry(signal_text) 
+        if entry_data:
+            pair_raw = entry_data['pair'] 
+            direction = entry_data['direction']
+            api_symbol = bingx_api_instance._format_symbol_for_swap(pair_raw)
+            position_side = direction.upper()
+            order_side = 'buy' if position_side == 'LONG' else 'sell'
+
+            logger.info(f"[Main C5 Entry] Отримано вхідний сигнал для {pair_raw} ({api_symbol}) {position_side}. Ініціюємо вхід по ринку...")
+            market_order_result = bingx_api_instance.place_market_order_basic(
+                symbol=api_symbol,
+                side=order_side,
+                                position_side=position_side,
+                margin_usdt=margin_usdt,
+                leverage=leverage
+            )
+            if market_order_result and market_order_result.get('id') and market_order_result.get('filled') > 0:
+                filled_amount = market_order_result.get('filled')
+                market_symbol = market_order_result.get('symbol')
+                logger.info(f"[Main C5 Entry] Ринковий ордер виконано. Обсяг: {filled_amount}. Очікуємо деталі сигналу для {market_symbol}...")
+                pending_channel5_details[market_symbol] = {
+                    'position_side': position_side,
+                    'initial_amount': filled_amount,
+                    'margin_usdt': margin_usdt,
+                    'leverage': leverage,
+                    'entry_price': market_order_result.get('average', market_order_result.get('price')),
+                    'market_order_id': market_order_result.get('id'),
+                    'timestamp': time.time()
+                }
+            else:
+                 logger.error(f"[Main C5 Entry] Не вдалося виконати ринковий ордер для {api_symbol}. Відповідь: {market_order_result}")
+
+        else: # Якщо це не entry сигнал, пробуємо парсити як details
+            details_data = signal_interpreter.parse_channel_5_details(signal_text, config)
+            if details_data:
+                pair_raw = details_data['pair']
+                api_symbol_details = bingx_api_instance._format_symbol_for_swap(pair_raw)
+                if api_symbol_details in pending_channel5_details:
+                    logger.info(f"[Main C5 Details] Знайдено деталі для {api_symbol_details}. Встановлюємо SL/TP...")
+                    entry_info = pending_channel5_details.pop(api_symbol_details) 
+                    
+                    market_symbol = api_symbol_details 
+                    position_side = entry_info['position_side']
+                    initial_amount = entry_info['initial_amount']
+                    entry_price = entry_info['entry_price']
+                    
+                    sl_price = details_data.get('stop_loss') 
+                    tp_prices = details_data.get('take_profits', [])
+
+                    sl_order = None
+                    if sl_price is not None:
+                        sl_order = bingx_api_instance.set_stop_loss(market_symbol, position_side, sl_price, initial_amount)
+                        if not sl_order or not sl_order.get('id'):
+                            logger.error(f"[Main C5 Details] Не вдалося розмістити SL ордер. SL={sl_price}. Відп: {sl_order}")
+                            sl_order = None 
+
+                    if tp_prices and initial_amount > 0 and tp_distribution:
+                        logger.info(f"[Main C5 Details] Спроба встановити {len(tp_prices)} TP...")
+                        tp_orders = bingx_api_instance.set_take_profits(market_symbol, 
+                                                                        position_side, 
+                                                                        initial_amount,  # <-- Правильна позиція
+                                                                        tp_prices,       # <-- Правильна позиція
+                                                                        tp_distribution) # <-- Правильна позиція
+                        if not tp_orders or len(tp_orders) != len(tp_prices):
+                            logger.error(f"[Main C5 Details] Не вдалося створити всі TP ({len(tp_orders)}/{len(tp_prices)}). TP={tp_prices}. Відп: {tp_orders}")
+                            tp_orders = [] 
+                        else:
+                            logger.info(f"[Main C5 Details] Успішно створено {len(tp_orders)} TP.")
+                    elif tp_prices:
+                        logger.warning(f"[Main C5 Details] TP ціни є, але обсяг 0 або tp_dist порожній. TP не вст.")
+                    
+                    if sl_order and tp_orders and len(tp_orders) == len(tp_prices):
+                        conn_add_c5: Optional[sqlite3.Connection] = None
+                        try:
+                            conn_add_c5 = data_manager.get_db_connection()
+                            if not conn_add_c5: raise Exception("DB connection failed")
+                            position_data_to_db = {
+                                'signal_channel_key': channel_key,
+                                'symbol': market_symbol,
+                                'position_side': position_side,
+                                'entry_price': entry_price,
+                                'initial_amount': initial_amount,
+                                'current_amount': initial_amount,
+                                'initial_margin': entry_info['margin_usdt'],
+                                'leverage': entry_info['leverage'],
+                                'sl_order_id': sl_order['id'],
+                                'tp_order_ids': [tp['id'] for tp in tp_orders],
+                                'related_limit_order_id': None,
+                                'is_breakeven': 0,
+                                'is_active': 1
+                            }
+                            new_pos_id = data_manager.add_new_position(conn_add_c5, position_data_to_db)
+                            if new_pos_id:
+                                logger.info(f"[Main C5 Details] Позиція {market_symbol} збережена в БД з ID {new_pos_id}.")
+                            else:
+                                raise Exception("Failed to add position to DB")
+                        except Exception as db_err_c5:
+                             logger.error(f"[Main C5 Details] Помилка БД при збереженні позиції {market_symbol}: {db_err_c5}", exc_info=True)
+                             # Скасувати SL і TP
+                             cancel_ids = [o['id'] for o in [sl_order] + tp_orders if o and o.get('id')]
+                             if cancel_ids: bingx_api_instance.cancel_multiple_orders(market_symbol, cancel_ids)
+                        finally:
+                            if conn_add_c5: conn_add_c5.close()
+                    else:
+                        logger.error(f"[Main C5 Details] Не вдалося створити повний набір SL/TP. SL: {bool(sl_order)}, TP: {len(tp_orders)}/{len(tp_prices)}. Збереження скасовано.")
+                        if sl_order and sl_order.get('id'):
+                            bingx_api_instance.cancel_order(market_symbol, sl_order['id'])
+                else:
+                     logger.warning(f"[Main C5 Details] Отримано деталі для {api_symbol_details}, але немає відповідного запису в pending_channel5_details.")
 
     logger.info(f"--- Завершено обробку сигналу від: {source_name} ({channel_key}) ---")
 

@@ -217,7 +217,7 @@ def update_position_status(conn: sqlite3.Connection, position_id: int, is_active
         return False
 
 def update_position_amount(conn: sqlite3.Connection, position_id: int, new_amount: float) -> bool:
-    """Оновлює поле current_amount."""
+    """Оновлює поточний обсяг (current_amount) для позиції."""
     return _update_position_field(conn, position_id, 'current_amount', new_amount)
 
 def get_active_position_count(conn: sqlite3.Connection, channel_group: str) -> int:
@@ -251,6 +251,39 @@ def get_active_position_count(conn: sqlite3.Connection, channel_group: str) -> i
     except sqlite3.Error as e:
         logger.error(f"[DataManager] Помилка при підрахунку активних позицій для групи '{channel_group}': {e}", exc_info=True)
         return -1
+
+def get_total_active_position_count(db_conn: sqlite3.Connection) -> int:
+    """Повертає загальну кількість активних позицій."""
+    try:
+        cursor = db_conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM active_positions WHERE is_active = 1")
+        count = cursor.fetchone()[0]
+        logger.debug(f"Знайдено {count} активних позицій.") # Додамо лог
+        return count
+    except sqlite3.Error as e:
+        logger.error(f"Помилка отримання загальної кількості активних позицій: {e}", exc_info=True)
+        return -1 # Повертаємо -1 у разі помилки
+
+def update_position_sl_and_breakeven(db_conn: sqlite3.Connection, position_id: int, new_sl_order_id: str, is_breakeven: int) -> bool:
+    """Оновлює SL ордер ID та статус беззбитковості для позиції."""
+    try:
+        cursor = db_conn.cursor()
+        cursor.execute("""
+            UPDATE active_positions
+            SET sl_order_id = ?, is_breakeven = ?
+            WHERE id = ? AND is_active = 1
+        """, (new_sl_order_id, is_breakeven, position_id))
+        db_conn.commit()
+        updated_rows = cursor.rowcount
+        if updated_rows > 0:
+            logger.info(f"Оновлено SL ID на {new_sl_order_id} та is_breakeven на {is_breakeven} для позиції {position_id}.")
+            return True
+        else:
+            logger.warning(f"Спроба оновити SL/ББ для неіснуючої або неактивної позиції {position_id}.")
+            return False
+    except sqlite3.Error as e:
+        logger.error(f"Помилка оновлення SL ID та статусу ББ для позиції {position_id}: {e}", exc_info=True)
+        return False
 
 # --- Приклад використання --- 
 if __name__ == '__main__':

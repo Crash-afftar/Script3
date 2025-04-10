@@ -223,7 +223,7 @@ _(Без змін, лише додати `leverage` для повноти)_
     }
   },
   "position_limits": {
-    "group_1_2_4_max_open": 2
+      "group_1_2_4_max_open": 2
   }
 }
 ```
