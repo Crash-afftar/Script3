@@ -226,251 +226,134 @@ class PositionManager:
             else:
                  self.logger.debug(f"[PositionManager] Розрахунковий remaining_amount ({remaining_amount:.8f}) не змінився суттєво порівняно з БД ({current_amount:.8f}). Оновлення БД не потрібне.")
 
-        # --- Переміщення SL в БЕЗЗБИТОК --- 
-        # Умови: SL ще не в ББ, хоча б один TP закрився, SL ордер ще активний
-        if not is_breakeven and any_tp_filled_or_closed and (sl_status == 'open' or sl_status == 'new'):
-            self.logger.info(f"[PositionManager] Спрацював TP для позиції {position_id}. Переміщення SL в ББ (ціна: {entry_price})...")
+            # --- Логіка переміщення SL в ББ ---
+            # Умови: SL ще не в ББ, хоча б один TP закрився, SL ордер ще активний
+            if not is_breakeven and any_tp_filled_or_closed and (sl_status == 'open' or sl_status == 'new'):
+                self.logger.info(f"[PositionManager] Спрацював TP для позиції {position_id}. Переміщення SL в ББ (ціна: {entry_price})...")
 
-            # --- Логіка Cancel + Create SL --- 
-            old_sl_order_id = sl_order_id # Зберігаємо старий ID для скасування
-            new_sl_order = None
-            new_sl_order_id_str = None
-            cancel_success = False
-            new_sl_success = False
+                old_sl_order_id = sl_order_id # Зберігаємо старий ID для скасування
+                new_sl_order = None
+                new_sl_order_id_str = None
+                new_sl_success = False
+                cancel_verified = False # Буде True тільки після успішної верифікації
 
-            # 1. Скасувати старий SL
-            if old_sl_order_id:
-                self.logger.info(f"[PM ББ] Скасування старого SL ордера ID: {old_sl_order_id}...")
-                try:
-                    cancel_success = self.bingx_api.cancel_order(symbol, old_sl_order_id)
-                    if cancel_success:
-                        self.logger.info(f"[PM ББ] Старий SL ордер {old_sl_order_id} скасовано.")
+                # 1. Спроба скасувати старий SL
+                if old_sl_order_id:
+                    self.logger.info(f"[PM ББ] Крок 1: Спроба скасування старого SL ордера ID: {old_sl_order_id}...")
+                    cancel_attempt_finished = False
+                    try:
+                        # --- Додано блок перевірки статусу перед скасуванням ---
+                        self.logger.debug(f"[PM ББ] Перевірка статусу SL {old_sl_order_id} ПЕРЕД скасуванням...")
+                        pre_cancel_info = self._fetch_order_status(symbol, old_sl_order_id)
+                        pre_cancel_status = pre_cancel_info.get('status') if pre_cancel_info else 'error'
+                        self.logger.debug(f"[PM ББ] Статус SL {old_sl_order_id} ПЕРЕД скасуванням: {pre_cancel_status}")
+                        # --- Кінець блоку перевірки ---
+
+                        # Скасовуємо тільки якщо він ще 'open' або 'new'
+                        if pre_cancel_status in ['open', 'new']:
+                            cancel_result = self.bingx_api.cancel_order(symbol, old_sl_order_id)
+                            if cancel_result: # Якщо функція повернула True
+                                self.logger.info(f"[PM ББ] Спроба скасування {old_sl_order_id} повернула успіх (буде верифіковано).)")
+                            else:
+                                self.logger.warning(f"[PM ББ] Спроба скасування {old_sl_order_id} повернула False без помилки (буде верифіковано).)")
+                        elif pre_cancel_status in ['canceled', 'closed']:
+                             self.logger.info(f"[PM ББ] SL {old_sl_order_id} вже був неактивний ({pre_cancel_status}) перед спробою скасування. Продовжуємо до верифікації.")
+                             # Вважаємо спробу "завершеною", хоча фактичного виклику cancel не було
+                        elif pre_cancel_status == 'error':
+                             self.logger.warning(f"[PM ББ] Не вдалося отримати статус SL {old_sl_order_id} перед скасуванням (ймовірно, не існує). Продовжуємо до верифікації.")
+                        else: # Невідомий статус
+                             self.logger.warning(f"[PM ББ] Невідомий статус SL {old_sl_order_id} ({pre_cancel_status}) перед скасуванням. Продовжуємо до верифікації.")
+
+                        cancel_attempt_finished = True # Позначаємо, що етап спроби завершено
+
+                    except Exception as cancel_err:
+                        cancel_attempt_finished = True
+                        error_code = getattr(cancel_err, 'code', None)
+                        error_message = str(cancel_err).lower()
+                        # Важливо: помилка 109414 при СПРОБІ скасування тепер не є критичною,
+                        # бо ми все одно перевіримо статус на кроці верифікації.
+                        if error_code == 109414 or 'order not exist' in error_message:
+                            self.logger.warning(f"[PM ББ] Спроба скасування {old_sl_order_id} отримала помилку 'Order not exist' (109414). Продовжуємо до верифікації.")
+                        else:
+                            self.logger.error(f"[PM ББ] Неочікувана помилка при спробі скасування SL {old_sl_order_id}: {cancel_err}", exc_info=True)
+                            # У випадку неочікуваної помилки - не продовжуємо ББ в цій ітерації
+                            cancel_verified = False # Залишаємо як False
+                            new_sl_success = False # І новий не створюємо
+                            # Важливо: не виходимо, а даємо дійти до кінця логіки перевірки DB
+
+                    # --- Крок 1.5: Верифікація скасування ---
+                    # Виконується завжди, якщо була спроба або перевірка статусу перед спробою
+                    if cancel_attempt_finished:
+                        self.logger.info(f"[PM ББ] Крок 1.5: Верифікація статусу старого SL ордера {old_sl_order_id} ПІСЛЯ спроби скасування...")
+                        time.sleep(1) # Невелика пауза перед перевіркою
+                        verification_order_info = self._fetch_order_status(symbol, old_sl_order_id)
+                        verification_status = verification_order_info.get('status') if verification_order_info else 'error' # error, якщо fetch не вдався
+
+                        if verification_status in ['canceled', 'closed']:
+                            self.logger.info(f"[PM ББ] Верифікація: Старий SL {old_sl_order_id} підтверджено як неактивний (статус: {verification_status}). Скасування вважається успішним.")
+                            cancel_verified = True
+                        elif verification_status == 'error':
+                            self.logger.warning(f"[PM ББ] Верифікація: Не вдалося отримати статус старого SL {old_sl_order_id} ПІСЛЯ спроби скасування (ймовірно, дійсно не існує). Вважаємо скасування успішним.")
+                            cancel_verified = True
+                        elif verification_status == 'open':
+                            self.logger.warning(f"[PM ББ] Верифікація: Старий SL {old_sl_order_id} все ще має статус 'open' ПІСЛЯ спроби скасування. Скасування НЕ вдалося. Створення нового SL пропускається.")
+                            cancel_verified = False
+                        else: # unknown etc.
+                            self.logger.warning(f"[PM ББ] Верифікація: Старий SL {old_sl_order_id} має невідомий/неочікуваний статус '{verification_status}' ПІСЛЯ спроби скасування. Скасування НЕ вдалося.")
+                            cancel_verified = False
+                    # else: Якщо спроба скасування не була завершена (малоймовірно)
+                        # cancel_verified залишається False
+
+                else: # Якщо old_sl_order_id відсутній у БД
+                     self.logger.warning(f"[PM ББ] Немає ID старого SL для скасування позиції {position_id}. Вважаємо цей крок успішним.")
+                     cancel_verified = True # Старого SL немає, значить скасовувати не потрібно
+
+                # 2. Створити новий SL в ББ (тільки якщо скасування ВЕРИФІКОВАНО)
+                if cancel_verified:
+                    # --- Додаємо невелику паузу перед створенням нового SL ---
+                    self.logger.debug("[PM ББ] Пауза 2 секунди перед створенням нового SL...")
+                    time.sleep(2)
+                    # --- Кінець паузи ---
+
+                    # Використовуємо залишковий обсяг `remaining_amount`
+                    if remaining_amount > 1e-9: # Перевіряємо, чи є що захищати
+                        self.logger.info(f"[PM ББ] Крок 2: Створення нового SL ордера в ББ ({entry_price}) для залишку {remaining_amount:.8f}...")
+                        new_sl_order = self.bingx_api.set_stop_loss(
+                            symbol=symbol,
+                            position_side=position_data['position_side'],
+                            sl_price=entry_price,
+                            amount=remaining_amount
+                        )
+                        if new_sl_order and new_sl_order.get('id'):
+                            new_sl_order_id_str = str(new_sl_order.get('id')) # Перетворюємо на рядок
+                            self.logger.info(f"[PM ББ] Новий SL ордер успішно створено. ID: {new_sl_order_id_str}")
+                            new_sl_success = True
+                        else:
+                             # Використовуємо покращене логування
+                             error_details = getattr(new_sl_order, 'last_json_response', str(new_sl_order))
+                             self.logger.error(f"[PM ББ] НЕ вдалося створити новий SL ордер в ББ для позиції {position_id}. Залишок: {remaining_amount:.8f}, Ціна ББ: {entry_price}. Відповідь API/деталі: {error_details}")
+                             new_sl_success = False # Явно ставимо False
                     else:
-                        # Якщо cancel_order повернув False без помилки (малоймовірно, але можливо)
-                        self.logger.error(f"[PM ББ] Функція cancel_order повернула False для SL {old_sl_order_id}, але не викликала помилку.")
-                        cancel_success = False # Явно ставимо False
-                except Exception as cancel_err:
-                    # Перевіряємо, чи це помилка 'order not exist' від BingX
-                    error_code = getattr(cancel_err, 'code', None) # ccxt може додавати код помилки
-                    error_message = str(cancel_err).lower()
-                    # Код 109414 - 'order not exist' для BingX Swap V2
-                    if error_code == 109414 or 'order not exist' in error_message:
-                        self.logger.warning(f"[PM ББ] Не вдалося скасувати старий SL ордер {old_sl_order_id}: він вже не існує (або виконаний/скасований). Вважаємо це успішним скасуванням для цілей ББ.")
-                        cancel_success = True # Вважаємо, що мета досягнута
-                    else:
-                        # Інша, неочікувана помилка
-                        self.logger.error(f"[PM ББ] Не вдалося скасувати старий SL ордер {old_sl_order_id} для позиції {position_id} через неочікувану помилку: {cancel_err}", exc_info=True)
-                        cancel_success = False # Скасування не вдалося
-            else:
-                 self.logger.warning(f"[PM ББ] Немає ID старого SL для скасування позиції {position_id}.")
-                 # Якщо старого SL немає, все одно пробуємо створити новий
-                 cancel_success = True 
-
-            # 2. Створити новий SL в ББ (тільки якщо скасування вдалося або не було потрібно)
-            if cancel_success:
-                # Використовуємо залишковий обсяг `remaining_amount`
-                if remaining_amount > 1e-9: # Перевіряємо, чи є що захищати
-                    self.logger.info(f"[PM ББ] Створення нового SL ордера в ББ ({entry_price}) для залишку {remaining_amount:.8f}...")
-                    new_sl_order = self.bingx_api.set_stop_loss(
-                        symbol=symbol, 
-                        position_side=position_data['position_side'], 
-                        sl_price=entry_price, 
-                        amount=remaining_amount
-                    )
-                    if new_sl_order and new_sl_order.get('id'):
-                        new_sl_order_id_str = str(new_sl_order.get('id')) # Перетворюємо на рядок
-                        self.logger.info(f"[PM ББ] Новий SL ордер успішно створено. ID: {new_sl_order_id_str}")
+                        self.logger.warning(f"[PM ББ] Залишок позиції {position_id} ({remaining_amount:.8f}) занадто малий для створення нового SL в ББ.")
+                        # Вважаємо операцію ББ умовно успішною, бо позиція майже закрита, старий SL скасовано.
                         new_sl_success = True
+                        new_sl_order_id_str = 'None' # Немає нового ID
+
+                # 3. Оновити БД, якщо все вдалося (скасування ВЕРИФІКОВАНО + створення нового SL або підтвердження малого залишку)
+                if cancel_verified and new_sl_success:
+                    self.logger.info(f"[PM ББ] Крок 3: Оновлення даних позиції {position_id} в БД (новий SL ID: {new_sl_order_id_str}, is_breakeven: 1)...")
+                    update_ok = data_manager.update_position_sl_and_breakeven(db_conn, position_id, new_sl_order_id_str, 1)
+
+                    if update_ok:
+                        self.logger.info(f"[PM ББ] Дані позиції {position_id} успішно оновлено в БД.")
+                        # Оновлюємо локальні змінні для подальшої логіки в цьому циклі
+                        sl_order_id = new_sl_order_id_str
+                        is_breakeven = True
                     else:
-                         self.logger.error(f"[PM ББ] Не вдалося створити новий SL ордер в ББ для позиції {position_id}. Відповідь: {new_sl_order}")
+                        self.logger.error(f"[PM ББ] Не вдалося оновити дані позиції {position_id} в БД!")
+                        # Поки що просто логуємо.
                 else:
-                    self.logger.warning(f"[PM ББ] Залишок позиції {position_id} ({remaining_amount:.8f}) занадто малий для створення нового SL в ББ.")
-                    # Вважаємо операцію ББ умовно успішною, бо позиція майже закрита, старий SL скасовано.
-                    new_sl_success = True 
-                    new_sl_order_id_str = 'None' # Немає нового ID
-                        
-            # 3. Оновити БД, якщо все вдалося (скасування + створення нового SL або підтвердження малого залишку)
-            if cancel_success and new_sl_success:
-                self.logger.info(f"[PM ББ] Оновлення даних позиції {position_id} в БД (новий SL ID: {new_sl_order_id_str}, is_breakeven: 1)...")
-                # Використовуємо нову функцію для оновлення обох полів одночасно
-                update_ok = data_manager.update_position_sl_and_breakeven(db_conn, position_id, new_sl_order_id_str, 1)
-                
-                if update_ok:
-                    self.logger.info(f"[PM ББ] Дані позиції {position_id} успішно оновлено в БД.")
-                    # Оновлюємо локальні змінні для подальшої логіки в цьому циклі
-                    sl_order_id = new_sl_order_id_str 
-                    is_breakeven = True 
-                else:
-                    self.logger.error(f"[PM ББ] Не вдалося оновити дані позиції {position_id} в БД!")
-                    # Критична помилка? Що робити? Можливо, спробувати ще раз в наступній ітерації?
-                    # Поки що просто логуємо.
-            else:
-                 self.logger.error(f"[PM ББ] Пропуск оновлення БД для позиції {position_id}, оскільки не всі кроки ББ були успішними (cancel_success={cancel_success}, new_sl_success={new_sl_success}).")
+                     self.logger.error(f"[PM ББ] Пропуск оновлення БД для позиції {position_id}, оскільки не всі кроки ББ були успішними (cancel_verified={cancel_verified}, new_sl_success={new_sl_success}).")
 
-        # --- Перевірка повного закриття позиції по TP --- 
-        # Якщо залишився дуже малий обсяг АБО всі TP ордери мають статус closed/canceled
-        if remaining_amount < 1e-9 or all_tp_closed_or_irrelevant:
-            # Перевіряємо, чи дійсно всі TP закриті, чи просто їх не було
-            all_tps_processed = True
-            if tp_order_ids: # Якщо TP були
-                for tp_id in tp_order_ids:
-                    tp_info = tp_orders_info.get(tp_id)
-                    tp_status = tp_info.get('status') if tp_info else 'unknown'
-                    if tp_status not in ['closed', 'canceled', 'filled']: # 'filled' може бути для ринкових TP
-                        all_tps_processed = False
-                        break
+            # --- Кінець блоку переміщення в ББ ---
 
-            if remaining_amount < 1e-9 or all_tps_processed:
-                 self.logger.info(f"[PositionManager] Позиція ID={position_id} ({symbol}) повністю закрита по Take Profit(s). Залишок: {remaining_amount:.8f}")
-                 self._handle_position_closed(position_id, 'all_tp_hit', position_data, db_conn, None) # Передаємо None, бо закриття по TP може бути через кілька ордерів
-                 return # Позиція закрита
-
-        # Якщо ми дійшли сюди, позиція все ще активна
-        self.logger.debug(f"[PositionManager] Перевірку позиції {position_id} ({symbol}) завершено, позиція активна.")
-
-    def _handle_position_closed(self, position_id: int, reason: str, position_data: Dict[str, Any], db_conn: sqlite3.Connection, closing_info: Optional[Dict[str, Any]] = None):
-        """Обробляє закриття позиції. Оновлює БД.
-           НЕ звільняє слот напряму, а викликає _trigger_slot_release.
-        """
-        symbol = position_data['symbol']
-        self.logger.info(f"--- Обробка закриття позиції ID={position_id} ({symbol}), Причина: {reason} ---")
-        
-        # 1. Оновити статус позиції в БД (передаємо db_conn)
-        status_info_text = f"{reason} at {datetime.datetime.now().isoformat()}" 
-        if closing_info:
-            status_info_text += f" | Order: {json.dumps(closing_info)}"
-            
-        update_success = data_manager.update_position_status(db_conn, position_id, False, status_info_text)
-        if not update_success:
-             self.logger.critical(f"[PositionManager] НЕ ВДАЛОСЯ оновити статус is_active=False для позиції ID={position_id}!")
-             
-        # 2. Перевірити, чи потрібно сигналізувати про звільнення слоту
-        # ... (логіка перевірки ББ та каналу) ...
-             
-        self.logger.info(f"--- Завершено обробку закриття позиції ID={position_id} ({symbol}) ---")
-
-    def _release_trading_slot(self, source_channel_key: str, position_id: int, was_breakeven: Optional[bool] = None):
-        """ЗАГЛУШКА: Звільняє торговий слот.
-           РЕАЛІЗАЦІЯ МАЄ БУТИ В MAIN.PY або окремому SlotManager!
-        """
-        # Ця функція тут лише для логування та позначення місця, де має відбуватися логіка
-        # Вона НЕ повинна змінювати стан слотів безпосередньо тут
-        status_note = f"(Стала ББ: {was_breakeven})" if was_breakeven is not None else ""
-        self.logger.info(f"[PositionManager] СИГНАЛ НА ЗВІЛЬНЕННЯ СЛОТУ для каналу {source_channel_key} (позиція {position_id}) {status_note}")
-        # TODO: Реалізувати механізм сповіщення або колбеку до main.py / SlotManager
-        pass
-
-    def _cancel_related_limit_order(self, symbol: str, limit_order_id: str, position_id: int, db_conn: sqlite3.Connection):
-        """Скасовує лімітний ордер, пов'язаний з позицією каналу 3."""
-        if not limit_order_id: return 
-        
-        self.logger.info(f"[PositionManager C3] Скасування пов'язаного лімітного ордера ID: {limit_order_id}...")
-        cancel_success = self.bingx_api.cancel_order(symbol, limit_order_id)
-        if cancel_success:
-            self.logger.info(f"[PositionManager C3] Лімітний ордер {limit_order_id} успішно скасовано. Оновлення БД...")
-            # Оновлюємо дані позиції в БД (передаємо db_conn)
-            db_update_ok = data_manager.update_position_limit_order(db_conn, position_id, None)
-            if not db_update_ok:
-                 self.logger.error(f"[PositionManager C3] Не вдалося оновити related_limit_order_id в БД для позиції {position_id}.")
-        else:
-            self.logger.warning(f"[PositionManager C3] Не вдалося скасувати лімітний ордер {limit_order_id}.")
-
-# Приклад використання (залишаємо для тестування, але реальна ініціалізація буде в main.py)
-if __name__ == '__main__':
-    # Налаштування логування
-    log_format = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
-    logging.basicConfig(level=logging.DEBUG, format=log_format)
-    main_logger = logging.getLogger("PositionManagerTest")
-
-    # --- Потрібно завантажити конфіг і .env --- 
-    from dotenv import load_dotenv
-    import json
-    import os
-
-    def load_config(config_path='config.json'):
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            main_logger.error(f"Не вдалося завантажити конфіг {config_path}: {e}")
-            return {}
-
-    load_dotenv()
-    api_key = os.getenv("BINGX_API_KEY")
-    api_secret = os.getenv("BINGX_SECRET_KEY")
-    config = load_config()
-    
-    if not api_key or not api_secret:
-        main_logger.critical("Не знайдено API ключів в .env")
-        exit(1)
-        
-    db_conn_main = data_manager.get_db_connection()
-    if not db_conn_main:
-         main_logger.critical("Не вдалося підключитися до БД.")
-         exit(1)
-         
-    if not data_manager.initialize_database(db_conn_main):
-         main_logger.critical("Не вдалося ініціалізувати БД.")
-         db_conn_main.close()
-         exit(1)
-
-    try:
-        main_logger.info("Ініціалізація BingXClient...")
-        bingx_client_instance = BingXClient(api_key, api_secret, main_logger)
-        
-        main_logger.info("Ініціалізація PositionManager...")
-        position_manager = PositionManager(bingx_client_instance, config)
-        
-        # --- Додамо тестову позицію в БД, щоб було що моніторити --- 
-        main_logger.info("Додавання тестової позиції в БД (якщо ще немає)...")
-        test_pos_data = {
-             'signal_channel_key': 'channel_1',
-             'symbol': 'LTC/USDT:USDT', # Використовуйте реальну пару для тестів
-             'position_side': 'LONG',
-             'entry_price': 75.0, 
-             'initial_amount': 0.1, 
-             'current_amount': 0.1, # Має бути таким же спочатку
-             'leverage': 10,
-             'sl_order_id': 'YOUR_REAL_SL_ORDER_ID_FOR_TESTING', # <-- ВАЖЛИВО: Замініть на реальний ID ордера
-             'tp_order_ids': ['YOUR_REAL_TP1_ORDER_ID', 'YOUR_REAL_TP2_ORDER_ID'], # <-- ВАЖЛИВО: Замініть
-             'is_breakeven': 0,
-             'is_active': 1
-        }
-        # Перевіримо, чи вже є така позиція (дуже примітивно)
-        existing = data_manager.get_active_positions(db_conn_main)
-        if not any(p['symbol'] == test_pos_data['symbol'] for p in existing):
-            new_id = data_manager.add_new_position(db_conn_main, test_pos_data)
-            if new_id:
-                 main_logger.info(f"Додано тестову позицію з ID {new_id}")
-                 # Оновлюємо ID для подальших тестів (не ідеально, але для прикладу)
-                 test_pos_data['sl_order_id'] = test_pos_data['sl_order_id'].replace("YOUR_REAL_", str(new_id)+"_")
-                 test_pos_data['tp_order_ids'][0] = test_pos_data['tp_order_ids'][0].replace("YOUR_REAL_", str(new_id)+"_")
-                 # Потрібно оновити і в БД, якщо ми хочемо симулювати реальні ID
-                 data_manager._update_position_field(db_conn_main, new_id, 'sl_order_id', test_pos_data['sl_order_id'])
-                 data_manager._update_position_field(db_conn_main, new_id, 'tp_order_ids', json.dumps(test_pos_data['tp_order_ids']))
-                 main_logger.info(f"(Примітка: ID ордерів у БД/прикладі можуть не відповідати реальним)")
-            else:
-                 main_logger.error("Не вдалося додати тестову позицію")
-        else:
-             main_logger.info("Тестова позиція вже існує або інша для цього символу.")
-        # ----------------------------------------------------------------
-
-        position_manager.start_monitoring()
-        main_logger.info("Менеджер позицій запущено. Натисніть Ctrl+C для зупинки.")
-        
-        # Тримаємо основний потік живим
-        while True:
-            time.sleep(1)
-            
-    except KeyboardInterrupt:
-        main_logger.info("Отримано сигнал зупинки (Ctrl+C).")
-        if 'position_manager' in locals() and position_manager:
-             position_manager.stop_monitoring()
-    except Exception as main_err:
-        main_logger.critical(f"Критична помилка: {main_err}", exc_info=True)
-        if 'position_manager' in locals() and position_manager:
-             position_manager.stop_monitoring()
-    finally:
-         if db_conn_main:
-             db_conn_main.close()
-             main_logger.info("Основне з'єднання з БД закрито.") 

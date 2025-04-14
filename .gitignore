@@ -1,0 +1,29 @@
+# Ignoring environment variables file with sensitive data
+.env
+
+# Ignoring logs
+*.log
+bot.log.*
+
+# Ignoring database files
+*.sqlite
+*.db
+
+# Ignoring python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignoring virtual environment
+venv/
+env/
+ENV/
+
+# Ignoring IDE specific files
+.vscode/
+.idea/
+
+# Ignoring OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini 

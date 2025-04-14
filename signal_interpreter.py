@@ -33,7 +33,7 @@ def normalize_pair(pair_str):
         pair += "USDT"
     return pair
 
-# --- Function to identify the channel --- (No parsing logic here anymore for C1)
+# --- Function to identify the channel ---
 def identify_signal_source(forwarded_channel_title: str, config: dict):
     """Визначає ключ каналу за його назвою з Telegram API."""
     logger.debug(f"Визначаю джерело за назвою: '{forwarded_channel_title}'")
@@ -180,12 +180,13 @@ def parse_channel_2(text: str, config: dict):
             signal_data["stop_loss"] = safe_float(sl_match.group(1))
             logger.debug(f"  [C2] Знайдено стоп-лосс: {signal_data['stop_loss']}")
         else:
-            logger.warning("  [C2] Не вдалося знайти стоп-лосс ('Стоп:...').")
-            return None # Обов'язкове
+            logger.warning("  [C2] Не вдалося знайти стоп-лосс ('Стоп:...'). Встановлюємо None.")
+            signal_data["stop_loss"] = None # Явно встановлюємо None, якщо не знайдено
+            # return None # Видаляємо return None, щоб зробити SL необов'язковим
 
-        # Перевірка обов'язкових полів
-        if not all([signal_data["pair"], signal_data["direction"], signal_data["entry_price"], signal_data["stop_loss"]]):
-             logger.warning("  [C2] Не всі обов'язкові поля (pair, direction, entry_price, stop_loss) було розпізнано.")
+        # Перевірка обов'язкових полів (виключаючи stop_loss)
+        if not all([signal_data["pair"], signal_data["direction"], signal_data["entry_price"]]):
+             logger.warning("  [C2] Не всі обов'язкові поля (pair, direction, entry_price) було розпізнано.")
              return None
 
         logger.info(f"  [C2] Розпізнано сигнал: { {k: v for k, v in signal_data.items() if k != 'raw_text'} }")
@@ -340,7 +341,7 @@ def parse_channel_4(text: str, config: dict):
     try:
         # 1. Пара та Напрямок (Шукаємо в першому рядку типу "Открыл UXLINK long")
         first_line = text.splitlines()[0] if text.splitlines() else ""
-        pair_match = re.search(r"Открыл\s+([A-Z0-9]+)\s+(long|short)", first_line, re.IGNORECASE)
+        pair_match = re.search(r"Открыл\s+([A-Z0-9/]+)\s+(long|short)", first_line, re.IGNORECASE)
         if pair_match:
             signal_data["pair"] = normalize_pair(pair_match.group(1))
             signal_data["direction"] = pair_match.group(2).upper()

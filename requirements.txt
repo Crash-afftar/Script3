@@ -1,6 +1,8 @@
-requests
-python-dotenv
-python-telegram-bot
-python-json-logger
-python-bingx
-# bingx-api-library # Потрібно знайти або написати клієнт для BingX API
+requests>=2.31.0
+python-dotenv>=1.0.0
+python-telegram-bot>=20.4
+python-json-logger>=2.0.7
+python-bingx>=1.0.0
+ccxt>=4.0.0
+sqlite3>=3.35.0
+websocket-client>=1.2.0

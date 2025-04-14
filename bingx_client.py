@@ -47,12 +47,19 @@ class BingXClient:
 
     def _format_symbol_for_swap(self, symbol: str) -> str:
         """Конвертує символ типу 'BTCUSDT' або '1000PEPEUSDT' у формат 'BASE/QUOTE:QUOTE' для ccxt swap."""
+        if symbol is None:
+            self.logger.error(f"[_format_symbol_for_swap] Отримано None замість символу!")
+            return None
+            
+        # Перевірка, чи символ вже у форматі BASE/QUOTE:QUOTE
         quote_currencies_pattern = '(?:USDT|BUSD|USDC|BTC|ETH)'
         if re.match(f"^[A-Z0-9]+/{quote_currencies_pattern}:{quote_currencies_pattern}$", symbol):
             self.logger.debug(f"[_format_symbol_for_swap] Символ '{symbol}' вже у правильному форматі swap. Без змін.")
             return symbol
 
+        # Перевірка, чи символ містить валютну пару
         quote_currencies = ['USDT', 'BUSD', 'USDC', 'BTC', 'ETH']
+        has_quote = False
         for quote in quote_currencies:
             if symbol.endswith(quote):
                 base = symbol[:-len(quote)]
@@ -60,9 +67,16 @@ class BingXClient:
                     formatted_symbol = f"{base}/{quote}:{quote}"
                     self.logger.debug(f"[_format_symbol_for_swap] Символ '{symbol}' конвертовано в '{formatted_symbol}'")
                     return formatted_symbol
-                else:
-                    break
-
+                has_quote = True
+                break
+        
+        # Якщо символ не містить валютну пару, додамо USDT
+        if not has_quote:
+            self.logger.warning(f"[_format_symbol_for_swap] Символ '{symbol}' не містить валютної пари. Автоматично додаємо USDT.")
+            formatted_symbol = f"{symbol}/USDT:USDT"
+            self.logger.info(f"[_format_symbol_for_swap] Символ '{symbol}' конвертовано в '{formatted_symbol}'")
+            return formatted_symbol
+            
         self.logger.warning(f"[_format_symbol_for_swap] Не вдалося автоматично форматувати символ '{symbol}'. Використовується як є.")
         return symbol
 
@@ -293,7 +307,8 @@ class BingXClient:
                 'positionSide': position_side.upper(),
                 'workingType': 'MARK_PRICE',
             }
-            # --- Додано детальне логування ---
+            
+            # --- Додано детальне логування ПЕРЕД викликом ---
             log_params = {
                 'symbol': ccxt_market_symbol,
                 'type': order_type,
